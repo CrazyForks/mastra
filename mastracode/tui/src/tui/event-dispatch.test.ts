@@ -66,6 +66,7 @@ function createMockEctx(): EventHandlerContext {
     renderCompletedTasksInline: vi.fn(),
     renderTaskDeltaInline: vi.fn(),
     addUserMessage: vi.fn(),
+    updateStatusLine: vi.fn(),
   } as unknown as EventHandlerContext;
 }
 
@@ -144,13 +145,15 @@ describe('dispatchEvent thread lifecycle', () => {
     expect(ectx.addUserMessage).not.toHaveBeenCalled();
   });
 
-  it('clears tasks, activePlan, and sandboxAllowedPaths on thread_changed', async () => {
+  it('clears per-thread state on thread_changed', async () => {
+    state.latestRequestPromptTokens = 90_000;
     await dispatchEvent(
       { type: 'thread_changed', threadId: 'new-thread', previousThreadId: 'old-thread' } as any,
       ectx,
       state,
     );
 
+    expect(state.latestRequestPromptTokens).toBeUndefined();
     expect(state.session.state.set).toHaveBeenCalledWith(
       expect.objectContaining({
         tasks: [],
@@ -160,13 +163,16 @@ describe('dispatchEvent thread lifecycle', () => {
     );
   });
 
-  it('clears tasks, activePlan, and sandboxAllowedPaths on thread_created', async () => {
+  it('clears per-thread state on thread_created', async () => {
+    state.latestRequestPromptTokens = 90_000;
+
     await dispatchEvent(
       { type: 'thread_created', thread: { id: 'brand-new', title: 'Brand New' } } as any,
       ectx,
       state,
     );
 
+    expect(state.latestRequestPromptTokens).toBeUndefined();
     expect(state.session.state.set).toHaveBeenCalledWith(
       expect.objectContaining({
         tasks: [],
@@ -244,6 +250,16 @@ describe('dispatchEvent thread lifecycle', () => {
     );
 
     expect((state.taskProgress as any).updateTasks).toHaveBeenCalledWith([]);
+  });
+
+  it('leaves the status line alone when the observer renames another thread of the session', async () => {
+    await dispatchEvent(
+      { type: 'om_thread_title_updated', cycleId: 'cycle-1', threadId: 'other-thread', newTitle: 'Log parser rewrite' },
+      ectx,
+      state,
+    );
+
+    expect(state.currentThreadTitle).toBe('Old thread');
   });
 
   it('does not clear non-ephemeral state like currentModelId', async () => {

@@ -60,6 +60,7 @@ import {
   isBackgroundToolPlaceholder,
   isTaskMutationTool,
 } from './handlers/tool.js';
+import { pruneChatContainer } from './prune-chat.js';
 import type { TUIState } from './state.js';
 import { BOX_INDENT, getMarkdownTheme, theme } from './theme.js';
 
@@ -1017,8 +1018,7 @@ export async function renderExistingMessages(state: TUIState): Promise<void> {
           // Render ask_user with the proper question component
           if (toolName === 'ask_user' && hasResult) {
             const askArgs = toolArgs as
-              | { question?: string; options?: Array<{ label: string; description?: string }> }
-              | undefined;
+              { question?: string; options?: Array<{ label: string; description?: string }> } | undefined;
             const answer = typeof resultValue === 'string' ? resultValue : formatToolResult(resultValue);
             const cancelled = answer === '(skipped)';
             if (askArgs?.question) {
@@ -1263,6 +1263,7 @@ export async function renderExistingMessages(state: TUIState): Promise<void> {
   }
 
   reconcileChatBoundarySpacers(state.chatContainer);
+  pruneChatContainer(state);
   state.ui.requestRender();
 }
 

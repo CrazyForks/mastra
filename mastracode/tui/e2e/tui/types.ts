@@ -123,6 +123,7 @@ export type ScenarioName =
   | 'om-threshold-persistence'
   | 'onboarding-om-follows-login'
   | 'quiet-settings'
+  | 'web-search-provider-settings'
   | 'quiet-streaming-preview-height'
   | 'quiet-tool-history-parity'
   | 'report-issue-command'
