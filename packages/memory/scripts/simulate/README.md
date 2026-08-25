@@ -39,13 +39,20 @@ The final lines are machine-greppable: `EXTRACTED_THREADS=`, `EXTRACTED_MESSAGES
 pnpm simulate:replay \
   --input  "postgres://user@127.0.0.1:55432/simulate_input" \
   --target "postgres://user@127.0.0.1:55432/simulate_arm_a" \
-  --org my-org --capture-model google/gemini-2.5-flash --curate-model deepseek/deepseek-chat
+  --org my-org --capture-model google/gemini-2.5-flash --curate-model deepseek/deepseek-chat \
+  --knowledge-resource my-project-id
 
 pnpm simulate:ab \
   --input "postgres://user@127.0.0.1:55432/simulate_input" \
   --target-prefix "postgres://user@127.0.0.1:55432/simulate_run" \
   --arm-a ./arm-a.txt --arm-b ./arm-b.txt
 ```
+
+`--knowledge-resource <id>` anchors the knowledge scope's resource rung on one shared id,
+mirroring how production Factory sets `knowledgeResourceId` to the project id. Without it,
+each thread's knowledge lands in its own per-thread resource silo, so the curator can never
+see — let alone merge — duplicate entities captured across threads. Pass the source
+deployment's project resource id whenever the replayed threads shared one in production.
 
 `--arm-a` / `--arm-b` point at text files holding the instructions appended to the built-in
 **capture** prompt (`--arm-a-curate` / `--arm-b-curate` do the same for the curator). The

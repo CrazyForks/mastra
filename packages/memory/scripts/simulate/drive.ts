@@ -149,10 +149,16 @@ export function assertCuratorConfigured(memory: MemoryLike): void {
   }
 }
 
-function requestContextWithOrg(organizationId: string): RequestContext {
+function requestContextWithOrg(organizationId: string, knowledgeResourceId?: string): RequestContext {
   if (!organizationId.trim()) throw new Error('Replay requires a non-empty organizationId.');
   const requestContext = new RequestContext();
   requestContext.set('organizationId', organizationId);
+  // Production Factory anchors the knowledge scope's resource rung on the
+  // project id (`knowledgeResourceId`), so every thread shares one resource
+  // silo and the curator can merge cross-thread duplicates. Without it the
+  // replay scopes knowledge by the OM row's per-thread resourceId, which
+  // makes cross-thread duplicates structurally invisible to curation.
+  if (knowledgeResourceId?.trim()) requestContext.set('knowledgeResourceId', knowledgeResourceId);
   return requestContext;
 }
 
@@ -189,8 +195,33 @@ export type ReplayOptions = {
   captureAgent: Pick<Agent, 'generate'>;
   /** Cycles between driver-issued curations, or `false` to never curate from the driver. */
   curationCadence: number | false;
+  /** Shared resource rung for knowledge scope (mirrors production Factory's project id). */
+  knowledgeResourceId?: string;
   onEvent?: (line: string) => void;
 };
+
+/**
+ * Local-run resilience: retry a model-backed call when the provider returns a
+ * rate-limit (429 / quota) error, honoring the provider's suggested delay when
+ * present. Non-quota errors propagate immediately.
+ */
+async function withQuotaRetry<T>(label: string, fn: () => Promise<T>, onEvent?: (line: string) => void): Promise<T> {
+  const maxAttempts = 6;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const statusCode = (error as { statusCode?: number })?.statusCode;
+      const isQuota = statusCode === 429 || /quota exceeded|rate limit/i.test(message);
+      if (!isQuota || attempt >= maxAttempts) throw error;
+      const suggested = message.match(/retry in ([\d.]+)\s*s/i)?.[1];
+      const delayMs = Math.min((suggested ? parseFloat(suggested) : 15 * 2 ** (attempt - 1)) * 1000 + 2000, 120_000);
+      onEvent?.(`RATE_LIMIT label=${label} attempt=${attempt}/${maxAttempts} delayMs=${Math.round(delayMs)}`);
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+  }
+}
 
 /**
  * Replay an ordered list of reconstructed cycles through the real capture extractor
@@ -200,13 +231,16 @@ export type ReplayOptions = {
  * cycle *source* behind this same signature, not a rewrite.
  */
 export async function replayCycles(options: ReplayOptions): Promise<ReplayResult> {
-  const { cycles, threadId, resourceId, organizationId, memory, subconscious, captureAgent } = options;
+  const { cycles, threadId, resourceId, organizationId, memory, subconscious, captureAgent, knowledgeResourceId } =
+    options;
   assertCuratorConfigured(memory);
 
   const store = await memory.storage.getStore('knowledge');
   if (!store) throw new Error('Replay requires a configured knowledge storage domain.');
 
-  const scope = [`org:${organizationId}`, `resource:${resourceId}`, `thread:${threadId}`];
+  // Knowledge is scoped by the override when present (matching production capture).
+  const scopeResourceId = knowledgeResourceId?.trim() || resourceId;
+  const scope = [`org:${organizationId}`, `resource:${scopeResourceId}`, `thread:${threadId}`];
   const extractors = subconscious.createObservationExtractors();
   const capture = extractors.find(extractor => extractor.slug === 'capture');
   if (!capture) throw new Error('Replay requires the built-in "capture" observation extractor.');
@@ -223,7 +257,11 @@ export async function replayCycles(options: ReplayOptions): Promise<ReplayResult
     // as a `failed` curation and counted in the summary rather than killing the arm.
     let outcome: CurationOutcome;
     try {
-      ({ outcome } = await memory.runCuration({ threadId, resourceId, requestContext }));
+      ({ outcome } = await withQuotaRetry(
+        'curation',
+        () => memory.runCuration({ threadId, resourceId, requestContext }),
+        options.onEvent,
+      ));
     } catch (error) {
       outcome = 'failed';
       warnings.push(`cycle ${cycleIndex}: curation failed (${error instanceof Error ? error.message : String(error)})`);
@@ -252,16 +290,21 @@ export async function replayCycles(options: ReplayOptions): Promise<ReplayResult
   };
 
   for (const [cycleIndex, cycle] of cycles.entries()) {
-    const requestContext = requestContextWithOrg(organizationId);
+    const requestContext = requestContextWithOrg(organizationId, knowledgeResourceId);
     const hookContext = { threadId, resourceId, memory, requestContext } as unknown as Parameters<
       typeof capture.resolve
     >[0];
     const resolved = await capture.resolve(hookContext);
 
-    const result = await captureAgent.generate(`${resolved.instructions}\n\n## Observations\n\n${cycle.observations}`, {
-      structuredOutput: { schema: resolved.schema },
-      requestContext,
-    } as never);
+    const result = await withQuotaRetry(
+      'capture',
+      () =>
+        captureAgent.generate(`${resolved.instructions}\n\n## Observations\n\n${cycle.observations}`, {
+          structuredOutput: { schema: resolved.schema },
+          requestContext,
+        } as never),
+      options.onEvent,
+    );
 
     const extracted = (result as { object?: unknown }).object;
     if (extracted === undefined) {
@@ -300,7 +343,7 @@ export async function replayCycles(options: ReplayOptions): Promise<ReplayResult
   // stages of curation. Skipped entirely when the cadence is off — flushing there would
   // reintroduce exactly the driver-initiated curation the caller asked us not to do.
   if (options.curationCadence !== false && sinceLastCuration > 0 && cycles.length) {
-    await runCurationStep(cycles.length - 1, requestContextWithOrg(organizationId));
+    await runCurationStep(cycles.length - 1, requestContextWithOrg(organizationId, knowledgeResourceId));
   }
 
   return { cyclesReplayed: cycles.length, curations, warnings };

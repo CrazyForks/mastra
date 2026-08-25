@@ -210,6 +210,40 @@ describe('replayCycles', () => {
     for (const context of curatorContexts) expect(context.get('organizationId')).toBe('acme');
   });
 
+  it('carries knowledgeResourceId on the request context so knowledge shares one resource silo', async () => {
+    // Production Factory anchors the knowledge resource rung on the project id; without
+    // this override every thread gets its own silo and cross-thread duplicate entities
+    // are structurally invisible to the curator.
+    const memory = createMemory();
+    const curator = curatorAlwaysCompletes();
+    const captureContexts: RequestContext[] = [];
+
+    await run(memory, {
+      cycles: cycles(2),
+      captureAgent: captureAgent(captureContexts),
+      knowledgeResourceId: 'project-1',
+    });
+
+    expect(captureContexts).toHaveLength(2);
+    for (const context of captureContexts) expect(context.get('knowledgeResourceId')).toBe('project-1');
+    const curatorContexts = curator.mock.calls
+      .map(call => ((call as unknown[])[1] as { requestContext?: RequestContext } | undefined)?.requestContext)
+      .filter(Boolean) as RequestContext[];
+    expect(curatorContexts.length).toBeGreaterThan(0);
+    for (const context of curatorContexts) expect(context.get('knowledgeResourceId')).toBe('project-1');
+  });
+
+  it('omits knowledgeResourceId from the request context when the override is not set', async () => {
+    const memory = createMemory();
+    curatorAlwaysCompletes();
+    const captureContexts: RequestContext[] = [];
+
+    await run(memory, { cycles: cycles(1), captureAgent: captureAgent(captureContexts) });
+
+    expect(captureContexts).toHaveLength(1);
+    expect(captureContexts[0]!.get('knowledgeResourceId')).toBeUndefined();
+  });
+
   it('does not complete quietly when the curator omits its completion marker', async () => {
     const memory = createMemory();
     // Fail-closed: without <curation-complete .../> the cursor cannot advance, and a

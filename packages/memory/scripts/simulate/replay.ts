@@ -139,6 +139,8 @@ export type ArmRunOptions = {
   curateModel: string;
   embedder: string;
   onlyThreads?: string[];
+  /** Shared knowledge resource rung (production Factory project id). */
+  knowledgeResourceId?: string;
   onEvent?: (line: string) => void;
 };
 
@@ -194,6 +196,7 @@ export async function runArm(options: ArmRunOptions): Promise<ArmRunResult> {
         subconscious,
         captureAgent,
         curationCadence: arm.curationCadence,
+        knowledgeResourceId: options.knowledgeResourceId,
         onEvent: line => log(`[${arm.name}][${threadId.slice(0, 8)}] ${line}`),
       });
 
@@ -246,7 +249,7 @@ async function main() {
 
   if (!input || !target) {
     throw new Error(
-      'Usage: simulate:replay --input <local-pg-url> --target <local-pg-url> [--org id] [--model id] [--cadence N|off]',
+      'Usage: simulate:replay --input <local-pg-url> --target <local-pg-url> [--org id] [--model id] [--cadence N|off] [--knowledge-resource id]',
     );
   }
 
@@ -268,6 +271,7 @@ async function main() {
     curateModel,
     embedder: args.get('embedder') ?? 'google/gemini-embedding-001',
     onlyThreads: args.getAll('thread-id'),
+    knowledgeResourceId: args.get('knowledge-resource'),
   });
 
   console.log(`ARM=${arm.name}`);
