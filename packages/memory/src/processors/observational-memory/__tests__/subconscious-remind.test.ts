@@ -1158,8 +1158,8 @@ describe('Subconscious remind ask lane', () => {
       kind: 'project',
       scope: ['org:acme', 'resource:user-42'],
     });
-    const item = await store.appendItem({
-      parentNodeId: node.id,
+    const item = await store.appendKnowledge({
+      node,
       text: 'Project Atlas launches January 15.',
       scope: ['org:acme', 'resource:user-42'],
       sourceThreadId: 'beta',

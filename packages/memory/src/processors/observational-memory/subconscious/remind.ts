@@ -95,8 +95,8 @@ async function dropFreshOwnItems(
 ): Promise<SearchKnowledgeResult[]> {
   const checks = await Promise.all(
     sources.map(async source => {
-      if (source.type !== 'item') return true;
-      const item = await store.getItem({ id: source.id }).catch(() => null);
+      if (source.type !== 'record') return true;
+      const item = await store.getKnowledge({ id: source.id }).catch(() => null);
       if (!item) return true;
       // KnowledgeItems written by the thread's own subconscious sub-agents (curate, learn, capture)
       // carry a `subconscious:<threadId>:<agent>` source — they are this thread's too.
