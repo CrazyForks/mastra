@@ -399,8 +399,8 @@ describe('Subconscious remind', () => {
         kind: 'project',
         scope: ['org:acme', 'resource:user-42'],
       });
-      return store.appendItem({
-        parentNodeId: node.id,
+      return store.appendKnowledge({
+        node,
         text: 'Project Atlas launches January 15.',
         scope: ['org:acme', 'resource:user-42'],
         sourceThreadId: 'beta',
@@ -505,8 +505,8 @@ describe('Subconscious remind', () => {
         kind: 'program',
         scope: ['org:acme', 'resource:user-42'],
       });
-      await store.appendItem({
-        parentNodeId: node.id,
+      await store.appendKnowledge({
+        node,
         text: 'The launch happens January 15.',
         scope: ['org:acme', 'resource:user-42'],
         sourceThreadId: 'alpha',
