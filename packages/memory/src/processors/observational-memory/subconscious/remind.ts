@@ -115,8 +115,9 @@ export function remindThreadKey(parentThreadId: string): string {
 export interface SubconsciousRemindOptions {
   /**
    * Returns the Memory that backs the reminder agent's own conversation. Called on demand so a
-   * session that never reminds never builds one; the owner caches the instance, and per-session
-   * identity is carried by the thread key alone, not by the instance.
+   * session that never reminds never builds one, and built fresh per call so each session's
+   * effective model applies. Per-session identity is carried by the thread key alone, never by
+   * the instance.
    */
   createRemindMemory?: () => Memory;
 }
