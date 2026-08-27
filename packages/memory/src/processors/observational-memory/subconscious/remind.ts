@@ -782,6 +782,9 @@ export class SubconsciousRemindExtractor extends Extractor<string> {
             prompt,
             requestContext: context.requestContext,
             maxSteps: config.maxSteps,
+            // The passive evaluation stopped waiting when its calling turn aborted before this path
+            // moved onto the lane; keep that. The lane turn itself still completes and persists.
+            abortSignal: context.abortSignal,
           });
           if (!reminder || /^<no-reminder\s*\/>$/i.test(reminder)) {
             return;
