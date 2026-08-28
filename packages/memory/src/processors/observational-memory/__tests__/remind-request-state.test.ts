@@ -14,13 +14,14 @@ function register(
   return registry.create({
     correlationId,
     conversation: conversationOverride,
+    sourceAgentId: 'main-agent',
     sourceThreadId: 'alpha',
     sourceResourceId: 'user-42',
   });
 }
 
 const registries: RemindRequestRegistry[] = [];
-function makeRegistry(options?: { deadlineMs?: number }) {
+function makeRegistry(options?: { deadlineMs?: number; maxTerminalEntries?: number }) {
   const registry = new RemindRequestRegistry(options);
   registries.push(registry);
   return registry;
@@ -40,6 +41,7 @@ describe('RemindRequestRegistry', () => {
       correlationId: 'remind-ask-1',
       status: 'pending',
       conversation,
+      sourceAgentId: 'main-agent',
       sourceThreadId: 'alpha',
       sourceResourceId: 'user-42',
     });
@@ -148,7 +150,20 @@ describe('RemindRequestRegistry', () => {
     });
   });
 
-  it('disposal aborts pending and terminal-sending requests but preserves terminal records', () => {
+  it('keeps terminal lifecycle state bounded', () => {
+    const registry = makeRegistry({ maxTerminalEntries: 2 });
+    for (const correlationId of ['first', 'second', 'third']) {
+      register(registry, correlationId);
+      registry.reserveTerminal(correlationId, conversation);
+      registry.markReplied(correlationId);
+    }
+
+    expect(registry.get('first')).toBeUndefined();
+    expect(registry.get('second')?.status).toBe('replied');
+    expect(registry.get('third')?.status).toBe('replied');
+  });
+
+  it('disposal releases all lifecycle records', () => {
     const registry = makeRegistry();
     register(registry, 'pending');
     register(registry, 'sending');
@@ -159,8 +174,8 @@ describe('RemindRequestRegistry', () => {
 
     registry.dispose();
 
-    expect(registry.get('pending')?.status).toBe('aborted');
-    expect(registry.get('sending')?.status).toBe('aborted');
-    expect(registry.get('replied')?.status).toBe('replied');
+    expect(registry.get('pending')).toBeUndefined();
+    expect(registry.get('sending')).toBeUndefined();
+    expect(registry.get('replied')).toBeUndefined();
   });
 });

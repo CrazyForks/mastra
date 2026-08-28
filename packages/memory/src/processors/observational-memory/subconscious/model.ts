@@ -46,10 +46,8 @@ export async function resolveReminderConversationModel(options: {
   if (omModel && omModel !== 'default' && !(omModel instanceof ModelByInputTokens)) {
     return omModel as SubconsciousModel;
   }
-  if (omModel instanceof ModelByInputTokens) {
-    return lastResortObservationalMemoryModel(omModel);
-  }
   if (mainAgent) return (await mainAgent.getModel({ requestContext })) as SubconsciousModel;
+  if (omModel instanceof ModelByInputTokens) return undefined;
   if (omModel === 'default') {
     return OBSERVATIONAL_MEMORY_DEFAULTS.observation.model as SubconsciousModel;
   }
@@ -81,11 +79,9 @@ export async function resolveSubconsciousAgentModel(options: {
 }
 
 /**
- * Resolve the OM model forms that cannot stand alone, used only when no better source exists
- * (no per-agent model, no main agent). The 'default' sentinel maps to the observational memory
- * default model, the same substitution the OM constructor makes. A token-routed model resolves
- * at its smallest tier: a subconscious agent's prompt is a question plus instructions, not a
- * transcript, so the smallest threshold is the honest input-size estimate.
+ * Resolve OM model forms for one-shot subconscious extractors when no better source exists.
+ * Reminder conversations do not use this fallback because their persisted transcript and tools
+ * make an immediate-text token estimate incomplete.
  */
 function lastResortObservationalMemoryModel(
   model: ObservationalMemoryModel | undefined,

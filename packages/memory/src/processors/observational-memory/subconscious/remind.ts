@@ -1,4 +1,5 @@
 import { Agent, createSignal } from '@mastra/core/agent';
+import type { SendAgentSignalAccepted, SendAgentSignalResult } from '@mastra/core/agent';
 import type { InputProcessor, ProcessInputStepArgs, ProcessInputStepResult } from '@mastra/core/processors';
 import type { RequestContext } from '@mastra/core/request-context';
 import type { KnowledgeScope, KnowledgeStorage, SearchKnowledgeResult } from '@mastra/core/storage';
@@ -178,16 +179,39 @@ type SignalSender = {
       resourceId: string;
       ifIdle?: { behavior?: 'wake'; streamOptions?: { requestContext?: RequestContext } };
     },
-  ): { accepted: Promise<{ action?: string; reason?: string } | undefined> };
+  ): SendAgentSignalResult;
 };
 
 type ReplyCapability = {
   sourceAgent: SignalSender;
-  sourceAgentId: string;
   conversation: RemindConversation;
+  expiryTimer: ReturnType<typeof setTimeout>;
 };
 
-const replyCapabilities = new Map<string, ReplyCapability>();
+type ReplyCapabilityRegistry = Map<string, ReplyCapability>;
+
+const replyCapabilitiesByRegistry = new WeakMap<RemindRequestRegistry, ReplyCapabilityRegistry>();
+
+function resolveReplyCapabilities(registry: RemindRequestRegistry): ReplyCapabilityRegistry {
+  let capabilities = replyCapabilitiesByRegistry.get(registry);
+  if (!capabilities) {
+    capabilities = new Map();
+    replyCapabilitiesByRegistry.set(registry, capabilities);
+  }
+  return capabilities;
+}
+
+function deleteReplyCapability(capabilities: ReplyCapabilityRegistry, correlationId: string) {
+  const capability = capabilities.get(correlationId);
+  if (capability) clearTimeout(capability.expiryTimer);
+  capabilities.delete(correlationId);
+}
+
+async function acceptSignalDelivery(result: SendAgentSignalResult): Promise<SendAgentSignalAccepted> {
+  const disposition = await result.accepted;
+  if (disposition.action === 'persist') await result.persisted;
+  return disposition;
+}
 
 export interface RemindAskToolOptions extends SubconsciousRemindOptions {
   memory: Memory;
@@ -205,9 +229,9 @@ async function resolveSignalSender(context: AskToolContext): Promise<SignalSende
 
 function createReplyTool(
   registry: RemindRequestRegistry,
+  capabilities: ReplyCapabilityRegistry,
   conversation: RemindConversation,
   allowedCorrelationIds: ReadonlySet<string>,
-  sourceAgent: SignalSender,
 ) {
   return createTool({
     id: 'reply_to_memory_question',
@@ -241,7 +265,13 @@ function createReplyTool(
 
       const reservation = registry.reserveTerminal(correlationId, conversation);
       if (reservation.outcome === 'duplicate') {
-        return { ok: true, correlationId, delivered: true, duplicate: true };
+        return {
+          ok: true,
+          correlationId,
+          delivered: reservation.record.status === 'replied',
+          duplicate: true,
+          status: reservation.record.status,
+        };
       }
       if (reservation.outcome === 'rejected') {
         return {
@@ -253,6 +283,20 @@ function createReplyTool(
               : reservation.reason === 'wrong_conversation'
                 ? `Question ${correlationId} belongs to another conversation.`
                 : `Question ${correlationId} can no longer accept a terminal answer.`,
+        };
+      }
+
+      const capability = capabilities.get(correlationId);
+      if (!capability) {
+        registry.fail(
+          correlationId,
+          'delivery_unknown',
+          'The source delivery capability expired before terminal reply.',
+        );
+        return {
+          ok: false,
+          correlationId,
+          error: `Question ${correlationId} no longer has a source delivery capability.`,
         };
       }
 
@@ -270,7 +314,7 @@ function createReplyTool(
           correlationId,
           sequence: reservation.record.terminalSequence,
           status: 'replied',
-          sourceAgentId: replyCapabilities.get(correlationId)?.sourceAgentId,
+          sourceAgentId: reservation.record.sourceAgentId,
           sourceThreadId: reservation.record.sourceThreadId,
           sourceResourceId: reservation.record.sourceResourceId,
           remindThreadId: conversation.remindThreadId,
@@ -278,31 +322,34 @@ function createReplyTool(
         },
       });
 
-      let accepted: { action?: string; reason?: string } | undefined;
+      let accepted: SendAgentSignalAccepted;
       try {
-        accepted = await sourceAgent.sendSignal(signal, {
-          threadId: reservation.record.sourceThreadId,
-          resourceId: reservation.record.sourceResourceId,
-          ifIdle: { behavior: 'wake', streamOptions: { requestContext: context.requestContext } },
-        }).accepted;
+        accepted = await acceptSignalDelivery(
+          capability.sourceAgent.sendSignal(signal, {
+            threadId: reservation.record.sourceThreadId,
+            resourceId: reservation.record.sourceResourceId,
+            ifIdle: { behavior: 'wake', streamOptions: { requestContext: context.requestContext } },
+          }),
+        );
       } catch (error) {
         registry.fail(correlationId, 'delivery_unknown', error instanceof Error ? error.message : String(error));
-        replyCapabilities.delete(correlationId);
+        deleteReplyCapability(capabilities, correlationId);
         return { ok: false, correlationId, error: 'Terminal answer delivery could not be confirmed.' };
       }
 
-      if (accepted?.action === 'blocked' || accepted?.action === 'discard') {
-        registry.fail(correlationId, 'delivery_failed', accepted.reason ?? accepted.action);
-        replyCapabilities.delete(correlationId);
+      if (accepted.action === 'blocked' || accepted.action === 'discard') {
+        const refusal = accepted.action === 'blocked' ? accepted.reason : accepted.action;
+        registry.fail(correlationId, 'delivery_failed', refusal);
+        deleteReplyCapability(capabilities, correlationId);
         return {
           ok: false,
           correlationId,
-          error: `The source conversation refused the answer: ${accepted.reason ?? accepted.action}.`,
+          error: `The source conversation refused the answer: ${refusal}.`,
         };
       }
 
       registry.markReplied(correlationId);
-      replyCapabilities.delete(correlationId);
+      deleteReplyCapability(capabilities, correlationId);
       return { ok: true, correlationId, delivered: true };
     },
   });
@@ -311,12 +358,12 @@ function createReplyTool(
 export function createReplyToolProcessor(
   registry: RemindRequestRegistry,
   conversation: RemindConversation,
+  capabilities: ReplyCapabilityRegistry = resolveReplyCapabilities(registry),
 ): InputProcessor {
   return {
     id: 'remind-current-question-tools',
     processInputStep(args: ProcessInputStepArgs): ProcessInputStepResult | undefined {
       const correlations = new Set<string>();
-      let capability: ReplyCapability | undefined;
       for (const message of args.messages as Array<{
         metadata?: Record<string, unknown>;
         content?: string | { parts?: Array<{ type?: string; text?: string }> };
@@ -336,7 +383,7 @@ export function createReplyToolProcessor(
             : /correlationId: (remind-ask-[0-9a-f-]+)/.exec(text)?.[1];
         if (!correlationId) continue;
         const record = registry.get(correlationId);
-        const candidate = replyCapabilities.get(correlationId);
+        const candidate = capabilities.get(correlationId);
         if (!record || record.status !== 'pending' || !candidate) continue;
         if (
           candidate.conversation.remindThreadId !== conversation.remindThreadId ||
@@ -344,15 +391,13 @@ export function createReplyToolProcessor(
         ) {
           continue;
         }
-        if (capability && capability.sourceAgent !== candidate.sourceAgent) continue;
-        capability = candidate;
         correlations.add(correlationId);
       }
-      if (!capability || correlations.size === 0) return undefined;
+      if (correlations.size === 0) return undefined;
       return {
         tools: {
           ...args.tools,
-          reply_to_memory_question: createReplyTool(registry, conversation, correlations, capability.sourceAgent),
+          reply_to_memory_question: createReplyTool(registry, capabilities, conversation, correlations),
         },
       };
     },
@@ -367,6 +412,7 @@ function createReminderAgent(args: {
   memory: Memory;
   scope: KnowledgeScope;
   registry: RemindRequestRegistry;
+  replyCapabilities: ReplyCapabilityRegistry;
   remindMemory?: Memory;
 }): Agent {
   return new Agent({
@@ -376,7 +422,7 @@ function createReminderAgent(args: {
     model: args.model,
     ...(args.remindMemory ? { memory: args.remindMemory } : {}),
     tools: createKnowledgeTools(args.memory, args.scope),
-    inputProcessors: [createReplyToolProcessor(args.registry, args.conversation)],
+    inputProcessors: [createReplyToolProcessor(args.registry, args.conversation, args.replyCapabilities)],
   });
 }
 
@@ -462,6 +508,7 @@ export function createRemindAskTool(options: RemindAskToolOptions) {
   // Same fallback the passive path uses. A per-call registry here would put the ask tool and the
   // reminder agent that answers it on two different authorities whenever an owner wired none.
   const registry = options.registry ?? fallbackRegistry();
+  const replyCapabilities = resolveReplyCapabilities(registry);
 
   /** The single acceptance-only dispatch path for every explicit reminder question. */
   const dispatch = async (
@@ -491,14 +538,20 @@ export function createRemindAskTool(options: RemindAskToolOptions) {
     const record = registry.create({
       correlationId,
       conversation,
+      sourceAgentId,
       sourceThreadId: threadId,
       sourceResourceId,
     });
-    replyCapabilities.set(correlationId, { sourceAgent, sourceAgentId, conversation });
+    const expiryTimer = setTimeout(
+      () => deleteReplyCapability(replyCapabilities, correlationId),
+      Math.max(0, record.deadlineAt - Date.now()),
+    );
+    expiryTimer.unref?.();
+    replyCapabilities.set(correlationId, { sourceAgent, conversation, expiryTimer });
 
     const fail = (status: 'delivery_failed' | 'model_failed', error: unknown) => {
       registry.fail(correlationId, status, error instanceof Error ? error.message : String(error));
-      replyCapabilities.delete(correlationId);
+      deleteReplyCapability(replyCapabilities, correlationId);
     };
 
     try {
@@ -510,6 +563,7 @@ export function createRemindAskTool(options: RemindAskToolOptions) {
         memory,
         scope,
         registry,
+        replyCapabilities,
         remindMemory: options.createRemindMemory?.(),
       });
       const contents = `Current time: ${new Date().toISOString()}\n\nQuestion [correlationId: ${correlationId}]: ${question}\n\nAnswer this by calling reply_to_memory_question with correlationId "${correlationId}".`;
@@ -586,12 +640,12 @@ export function createRemindAskTool(options: RemindAskToolOptions) {
       } catch (error) {
         return { ok: false, ...describeAskFailure(error) };
       }
-      if (record.status !== 'pending' && record.status !== 'replied') {
+      if (record.failure) {
         return {
           ok: false,
           correlationId: record.correlationId,
           status: record.status,
-          error: record.failure?.message,
+          error: record.failure.message,
         };
       }
 
@@ -599,7 +653,7 @@ export function createRemindAskTool(options: RemindAskToolOptions) {
         ok: true,
         accepted: true,
         correlationId: record.correlationId,
-        status: record.status,
+        status: 'pending',
         note: 'The answer will arrive as a correlated reactive remembered signal. This segment has no blocking checkpoint.',
       };
     },
@@ -609,9 +663,8 @@ export function createRemindAskTool(options: RemindAskToolOptions) {
 }
 
 /**
- * Registry used when the owner wired none. A reminder agent always carries the reply tool so its
- * toolset does not change shape between wake reasons; without a shared registry a reply simply finds
- * no matching request and is rejected, which is the correct answer for a question nobody asked here.
+ * Registry used when the owner wired none. The current-input processor injects the reply tool only
+ * when a correlated question in this registry belongs to the active reminder conversation.
  */
 let fallback: RemindRequestRegistry | undefined;
 function fallbackRegistry(): RemindRequestRegistry {
@@ -669,6 +722,7 @@ export class SubconsciousRemindExtractor extends Extractor<string> {
           // PARENT thread id, not from the agent id above, and matches the curate/learn convention.
           // The evaluation enters the same serialized conversation as asks, so a passive reminder
           // never interleaves with an in-flight question turn.
+          const registry = options?.registry ?? fallbackRegistry();
           const agent = createReminderAgent({
             parentThreadId: context.threadId,
             conversation: {
@@ -681,7 +735,8 @@ export class SubconsciousRemindExtractor extends Extractor<string> {
             scope,
             // A question can be delivered into this passive run, so it must carry the same reply
             // authority an ask-woken run has.
-            registry: options?.registry ?? fallbackRegistry(),
+            registry,
+            replyCapabilities: resolveReplyCapabilities(registry),
             remindMemory: options?.createRemindMemory?.(),
           });
           const reminder = await runReminderConversationTurn({

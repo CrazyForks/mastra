@@ -834,23 +834,21 @@ describe('Subconscious remind ask conversation', () => {
       const result: any = await tools.ask_memory.execute!({ question: 'what happened?' } as any, askContext());
       expect(result.ok).toBe(true);
       expect(result.accepted).toBe(true);
-      expect(result.status).toBe('replied');
+      expect(result.status).toBe('pending');
     } finally {
       generateSpy.mockRestore();
     }
   });
 
-  it('accepts a question when the observational memory model routes by input tokens', async () => {
+  it('does not collapse a token-routed observational-memory model without runtime context', async () => {
+    const config = { name: 'remind', maxSteps: 3, builtIn: true } as any;
     const tiered = new ModelByInputTokens({ upTo: { 1000: 'openai/gpt-5-nano', 100000: 'openai/gpt-5' } });
-    const { tools, generateSpy } = createAskTool({ omModel: tiered, response: 'Answered on the tiered model.' });
-    try {
-      const result: any = await tools.ask_memory.execute!({ question: 'what happened?' } as any, askContext());
-      expect(result.ok).toBe(true);
-      expect(result.accepted).toBe(true);
-      expect(result.status).toBe('replied');
-    } finally {
-      generateSpy.mockRestore();
-    }
+    await expect(resolveReminderConversationModel({ config, omModel: tiered })).resolves.toBeUndefined();
+
+    const mainAgent = { getModel: vi.fn(async () => 'main-agent-model') } as any;
+    await expect(resolveReminderConversationModel({ config, omModel: tiered, mainAgent })).resolves.toBe(
+      'main-agent-model',
+    );
   });
 
   it('resolves default and token-routed models only as a last resort', async () => {
@@ -869,10 +867,11 @@ describe('Subconscious remind ask conversation', () => {
     );
   });
 
-  it('uses the smallest observational-memory tier without guessing prompt size', async () => {
-    const config = { name: 'remind', maxSteps: 3, builtIn: true } as any;
+  it('prefers a configured reminder model over token-routed observational memory', async () => {
     const tiered = new ModelByInputTokens({ upTo: { 1000: 'openai/gpt-5-nano', 100000: 'openai/gpt-5' } });
-    await expect(resolveReminderConversationModel({ config, omModel: tiered })).resolves.toBe('openai/gpt-5-nano');
+    const reminderModel = (() => 'openai/gpt-5') as any;
+    const config = { name: 'remind', maxSteps: 3, builtIn: true, model: reminderModel } as any;
+    await expect(resolveReminderConversationModel({ config, omModel: tiered })).resolves.toBe(reminderModel);
   });
 
   it('passes failover arrays and dynamic model configs to the reminder agent unreduced', async () => {
@@ -1783,7 +1782,7 @@ describe('correlated request lifecycle (real runtime)', () => {
     } as any);
     try {
       const result: any = await tools.ask_memory.execute!({ question: 'whose question is this' } as any, context());
-      expect(result).toEqual(expect.objectContaining({ ok: true, accepted: true, status: 'replied' }));
+      expect(result).toEqual(expect.objectContaining({ ok: true, accepted: true, status: 'pending' }));
       expect(rejected).toEqual(expect.objectContaining({ ok: false }));
       expect(rejected.error).toMatch(/another conversation/);
       await vi.waitFor(() => expect(sent).toHaveLength(1), { timeout: 10_000 });
@@ -1923,7 +1922,7 @@ describe('correlated request lifecycle (real runtime)', () => {
     } as any);
     try {
       const result: any = await tools.ask_memory.execute!({ question: 'protocol errors' } as any, context());
-      expect(result).toEqual(expect.objectContaining({ ok: true, accepted: true, status: 'replied' }));
+      expect(result).toEqual(expect.objectContaining({ ok: true, accepted: true, status: 'pending' }));
       await vi.waitFor(() => expect(outcomes).toHaveLength(3), { timeout: 10_000 });
       const byName = Object.fromEntries(outcomes);
       expect(byName.unknown).toEqual(expect.objectContaining({ ok: false }));

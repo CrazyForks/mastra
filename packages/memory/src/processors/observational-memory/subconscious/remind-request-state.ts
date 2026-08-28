@@ -16,6 +16,7 @@ export type RemindConversation = {
 export type RemindRequestRecord = {
   correlationId: string;
   conversation: RemindConversation;
+  sourceAgentId: string;
   sourceThreadId: string;
   sourceResourceId: string;
   createdAt: number;
@@ -39,15 +40,19 @@ function sameConversation(a: RemindConversation, b: RemindConversation): boolean
 export class RemindRequestRegistry {
   readonly #entries = new Map<string, RemindRequestRecord>();
   readonly #deadlineTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  readonly #terminalOrder: string[] = [];
   readonly #deadlineMs: number;
+  readonly #maxTerminalEntries: number;
 
-  constructor(options: { deadlineMs?: number } = {}) {
+  constructor(options: { deadlineMs?: number; maxTerminalEntries?: number } = {}) {
     this.#deadlineMs = options.deadlineMs ?? REMINDER_TURN_DEADLINE_MS;
+    this.#maxTerminalEntries = options.maxTerminalEntries ?? 1_000;
   }
 
   create(args: {
     correlationId: string;
     conversation: RemindConversation;
+    sourceAgentId: string;
     sourceThreadId: string;
     sourceResourceId: string;
     deadlineMs?: number;
@@ -62,6 +67,7 @@ export class RemindRequestRegistry {
     const record: RemindRequestRecord = {
       correlationId: args.correlationId,
       conversation: { ...args.conversation },
+      sourceAgentId: args.sourceAgentId,
       sourceThreadId: args.sourceThreadId,
       sourceResourceId: args.sourceResourceId,
       createdAt,
@@ -105,6 +111,7 @@ export class RemindRequestRegistry {
     record.status = 'replied';
     record.terminalAt = Date.now();
     this.#clearDeadline(correlationId);
+    this.#retainTerminal(correlationId);
   }
 
   fail(correlationId: string, status: RemindRequestFailureStatus, message: string): void {
@@ -114,20 +121,22 @@ export class RemindRequestRegistry {
     record.terminalAt = Date.now();
     record.failure = { status, message };
     this.#clearDeadline(correlationId);
+    this.#retainTerminal(correlationId);
   }
 
   dispose(): void {
-    for (const record of this.#entries.values()) {
-      if (record.status === 'pending' || record.status === 'terminal_sending') {
-        this.fail(
-          record.correlationId,
-          'aborted',
-          'Memory question was aborted because the request registry was disposed.',
-        );
-      }
-    }
     for (const timer of this.#deadlineTimers.values()) clearTimeout(timer);
     this.#deadlineTimers.clear();
+    this.#terminalOrder.length = 0;
+    this.#entries.clear();
+  }
+
+  #retainTerminal(correlationId: string): void {
+    this.#terminalOrder.push(correlationId);
+    while (this.#terminalOrder.length > this.#maxTerminalEntries) {
+      const expiredCorrelationId = this.#terminalOrder.shift();
+      if (expiredCorrelationId) this.#entries.delete(expiredCorrelationId);
+    }
   }
 
   #clearDeadline(correlationId: string): void {
