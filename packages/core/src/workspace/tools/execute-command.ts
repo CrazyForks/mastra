@@ -3,6 +3,7 @@ import { browserCliHandler } from '../../browser/cli-handler';
 import { createTool } from '../../tools';
 import { WORKSPACE_TOOLS } from '../constants';
 import { SandboxFeatureNotSupportedError } from '../errors';
+import type { WorkspaceFilesystem } from '../filesystem';
 import { coerceNumericString, emitWorkspaceMetadata, requireSandbox } from './helpers';
 import { DEFAULT_TAIL_LINES, truncateOutput, sandboxToModelOutput } from './output-helpers';
 import { startWorkspaceSpan } from './tracing';
@@ -85,12 +86,36 @@ function appendTerminalLine(parts: string[], terminalLine: string): string {
   return `${output}${separator}${terminalLine}`;
 }
 
+/**
+ * The workspace filesystem's advertised root, when the filesystem can name
+ * one that is valid inside the sandbox. Errors are swallowed: a root that
+ * cannot resolve (e.g. the sandbox failed to start) surfaces from the
+ * command itself with a real error, not from the cwd default.
+ */
+async function workspaceDefaultCwd(workspace: { filesystem?: unknown }): Promise<string | undefined> {
+  const filesystem = workspace.filesystem as WorkspaceFilesystem | undefined;
+  if (!filesystem?.defaultCwd) return undefined;
+  try {
+    return (await filesystem.defaultCwd()) || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Shared execute function used by both foreground-only and background-capable tool variants. */
 async function executeCommand(input: Record<string, any>, context: any) {
   let { command, cwd, tail } = input;
   const timeout = input.timeout != null ? (input.timeout as number) * 1000 : undefined;
   const background = input.background as boolean | undefined;
   const { workspace, sandbox } = requireSandbox(context);
+
+  // Default the working directory to the workspace filesystem's root when
+  // the caller doesn't pass one. The agent's prompt advertises that root as
+  // its working directory, so a bare command must run there — not at the
+  // provider default (usually $HOME). An explicit cwd always wins.
+  if (cwd == null) {
+    cwd = await workspaceDefaultCwd(workspace);
+  }
 
   // Extract tail pipe from command so output can stream in real time
   if (!background) {
@@ -297,7 +322,7 @@ Usage:
 - Commands run in a shell, so pipes, redirects, and chaining (&&, ||, ;) all work.
 - Always quote file paths that contain spaces (e.g., cd "/path/with spaces").
 - Use the timeout parameter (in seconds) to limit execution time. Behavior when omitted depends on the sandbox provider.
-- Optionally use cwd to override the working directory. Commands run from the sandbox default if omitted.`;
+- Optionally use cwd to override the working directory. When omitted, commands run from the workspace root when the filesystem provides one, otherwise from the sandbox default.`;
 
 /** Foreground-only tool (no background param in schema). */
 export const executeCommandTool = createTool({

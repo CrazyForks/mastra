@@ -308,5 +308,16 @@ describe('SandboxFilesystem', () => {
       await expect(fs.exists('/a.txt')).resolves.toBe(true);
       expect(fs.basePath).toBe(WORKDIR);
     });
+
+    it('defaultCwd resolves the lazy workdir so bare commands run at the workspace root', async () => {
+      const sandbox = new FakeSandbox();
+      const fs = new SandboxFilesystem({
+        sandbox,
+        workdir: async () => WORKDIR,
+      });
+      await expect(fs.defaultCwd()).resolves.toBe(WORKDIR);
+      // Memoized: the sync surface now knows the root too.
+      expect(fs.basePath).toBe(WORKDIR);
+    });
   });
 });

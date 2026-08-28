@@ -841,3 +841,78 @@ describe('executeCommandTool browser CLI logic', () => {
     });
   });
 });
+
+describe('executeCommandTool default cwd', () => {
+  function createContextWithFilesystem(options: {
+    executeCommand: (command: string, args: string[], opts?: ExecuteCommandOptions) => Promise<CommandResult>;
+    defaultCwd?: () => Promise<string>;
+  }) {
+    const sandbox = {
+      id: 'test-sandbox',
+      name: 'test-sandbox',
+      provider: 'test',
+      status: 'running' as const,
+      executeCommand: options.executeCommand,
+    };
+    const filesystem = {
+      id: 'test-fs',
+      name: 'test-fs',
+      provider: 'test',
+      ...(options.defaultCwd ? { defaultCwd: options.defaultCwd } : {}),
+    } as any;
+    const workspace = new Workspace({ sandbox, filesystem });
+    const context: ToolExecutionContext = {
+      workspace,
+      writer: { custom: vi.fn() } as any,
+    };
+    return { context };
+  }
+
+  it('defaults cwd to the filesystem-advertised workspace root when omitted', async () => {
+    const seenCwd: (string | undefined)[] = [];
+    const { context } = createContextWithFilesystem({
+      defaultCwd: async () => '/home/user/repo',
+      executeCommand: async (_cmd, _args, opts) => {
+        seenCwd.push(opts?.cwd);
+        return { success: true, exitCode: 0, stdout: 'ok', stderr: '', executionTimeMs: 1 };
+      },
+    });
+
+    await execute({ command: 'pwd', timeout: null, cwd: null }, context);
+    expect(seenCwd).toEqual(['/home/user/repo']);
+  });
+
+  it('an explicit cwd always wins over the default', async () => {
+    const seenCwd: (string | undefined)[] = [];
+    const { context } = createContextWithFilesystem({
+      defaultCwd: async () => '/home/user/repo',
+      executeCommand: async (_cmd, _args, opts) => {
+        seenCwd.push(opts?.cwd);
+        return { success: true, exitCode: 0, stdout: 'ok', stderr: '', executionTimeMs: 1 };
+      },
+    });
+
+    await execute({ command: 'pwd', timeout: null, cwd: '/tmp/elsewhere' }, context);
+    expect(seenCwd).toEqual(['/tmp/elsewhere']);
+  });
+
+  it('runs without a cwd when the filesystem offers no default or it fails to resolve', async () => {
+    const seenCwd: (string | undefined)[] = [];
+    const run = async (defaultCwd?: () => Promise<string>) => {
+      const { context } = createContextWithFilesystem({
+        ...(defaultCwd ? { defaultCwd } : {}),
+        executeCommand: async (_cmd, _args, opts) => {
+          seenCwd.push(opts?.cwd);
+          return { success: true, exitCode: 0, stdout: 'ok', stderr: '', executionTimeMs: 1 };
+        },
+      });
+      await execute({ command: 'pwd', timeout: null, cwd: null }, context);
+    };
+
+    await run();
+    await run(async () => {
+      throw new Error('sandbox failed to start');
+    });
+    expect(seenCwd).toEqual([undefined, undefined]);
+  });
+});

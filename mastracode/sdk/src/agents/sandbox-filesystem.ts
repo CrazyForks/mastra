@@ -174,6 +174,17 @@ export class SandboxFilesystem implements WorkspaceFilesystem {
     return this.resolveAgainst(this.resolvedBase, inputPath);
   }
 
+  /**
+   * Default working directory for workspace commands: the workspace root.
+   * This filesystem lives inside the same sandbox the workspace executes
+   * commands in, so the root is a valid in-sandbox path. Resolving a lazy
+   * workdir may start the VM — acceptable here because the caller is about
+   * to run a command in it anyway.
+   */
+  async defaultCwd(): Promise<string> {
+    return this.base();
+  }
+
   // ── Command helper ─────────────────────────────────────────────────────
 
   private async exec(script: string): Promise<SandboxCommandResult> {

@@ -305,6 +305,18 @@ export interface WorkspaceFilesystem extends FilesystemLifecycle<FilesystemInfo>
   resolveAbsolutePath?(path: string): string | undefined;
 
   /**
+   * Absolute path inside the workspace's sandbox to use as the default
+   * working directory for commands when the caller doesn't pass `cwd`.
+   *
+   * Implement only when the filesystem lives inside the same sandbox the
+   * workspace executes commands in (e.g. a sandbox-backed filesystem rooted
+   * at a repo checkout). Host-path filesystems must not implement it — a
+   * host path is meaningless inside a remote sandbox. May start the sandbox
+   * when the root is lazily resolved.
+   */
+  defaultCwd?(): Promise<string>;
+
+  /**
    * Check if a path exists.
    */
   exists(path: string): Promise<boolean>;
