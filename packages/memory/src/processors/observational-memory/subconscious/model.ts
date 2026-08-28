@@ -26,23 +26,18 @@ export function usableObservationalMemoryModel(
 }
 
 /**
- * Resolve the model the reminder lane runs on, preserving configured failover. Unlike
- * {@link resolveSubconsciousAgentModel}, retry/fallback arrays pass through unchanged (the
- * Agent materializes failover itself), and a token-routed model resolves against an estimate
- * of this turn's instructions and prompt instead of always taking the smallest tier. The
- * estimate deliberately excludes lane history and tool schemas (both live inside the Agent at
- * run time), so routing skews small on long-lived lanes; past the largest threshold the tier
- * clamps to the largest rather than throwing.
+ * Resolve the model the reminder conversation runs on, preserving configured failover. A
+ * configured reminder-agent model wins. Otherwise an Agent-compatible observational-memory model
+ * passes through unchanged so the Agent can resolve dynamic and token-routed configuration against
+ * its complete conversation and tool context.
  */
-export async function resolveReminderLaneModel(options: {
+export async function resolveReminderConversationModel(options: {
   config: ResolvedSubconsciousAgent;
   omModel?: ObservationalMemoryModel;
   mainAgent?: ReflectionCommittedContext['mainAgent'];
   requestContext?: RequestContext;
-  /** Estimated input tokens for the turn about to run (chars/4 of the assembled text). */
-  estimatedInputTokens: number;
 }): Promise<SubconsciousModel | undefined> {
-  const { config, omModel, mainAgent, requestContext, estimatedInputTokens } = options;
+  const { config, omModel, mainAgent, requestContext } = options;
   if (config.model) {
     // A per-agent model is an AgentConfig['model'] form already — hand it to the Agent whole
     // so arrays keep their failover order and dynamic functions resolve at run time.
@@ -52,14 +47,7 @@ export async function resolveReminderLaneModel(options: {
     return omModel as SubconsciousModel;
   }
   if (omModel instanceof ModelByInputTokens) {
-    // `resolve` picks the tier for the given input size and may return a fallback array;
-    // return it unreduced. Past the largest threshold `resolve` throws — clamp to the largest
-    // tier instead: an oversized reminder turn should degrade, not fail the observation cycle.
-    const thresholds = omModel.getThresholds();
-    // `thresholds` is non-empty by construction (the ModelByInputTokens constructor rejects an
-    // empty config), so the last entry is always the largest tier.
-    const clamped = Math.min(estimatedInputTokens, thresholds[thresholds.length - 1]!);
-    return omModel.resolve(clamped) as SubconsciousModel;
+    return lastResortObservationalMemoryModel(omModel);
   }
   if (mainAgent) return (await mainAgent.getModel({ requestContext })) as SubconsciousModel;
   if (omModel === 'default') {

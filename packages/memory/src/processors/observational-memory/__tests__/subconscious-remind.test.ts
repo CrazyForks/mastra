@@ -10,8 +10,8 @@ import { applyExtractorHooks } from '../extracted-values';
 import { buildExtractorOutputSections, Extractor } from '../extractor';
 import { ModelByInputTokens } from '../model-by-input-tokens';
 import { SubconsciousRemindExtractor } from '../subconscious';
-import { resolveReminderLaneModel, resolveSubconsciousAgentModel } from '../subconscious/model';
-import { createRemindAskTool } from '../subconscious/remind';
+import { resolveReminderConversationModel, resolveSubconsciousAgentModel } from '../subconscious/model';
+import { createRemindAskTool, createReplyToolProcessor } from '../subconscious/remind';
 import { RemindRequestRegistry } from '../subconscious/remind-request-state';
 
 function createModel(response: string) {
@@ -340,9 +340,9 @@ describe('Subconscious remind', () => {
 
   it('shows the reminder agent the recent messages so it can skip what is already visible', async () => {
     const { Agent } = await import('@mastra/core/agent');
-    // The passive path enters the serialized reminder lane via queueMessage, not generate.
-    const queueSpy = vi.spyOn(Agent.prototype, 'queueMessage' as any);
-    queueSpy.mockClear();
+    // The passive path enters the continuing reminder conversation through sendMessage.
+    const sendMessageSpy = vi.spyOn(Agent.prototype, 'sendMessage' as any);
+    sendMessageSpy.mockClear();
     try {
       const extractor = new SubconsciousRemindExtractor({
         name: 'remind',
@@ -373,12 +373,12 @@ describe('Subconscious remind', () => {
         ...context,
       });
 
-      expect(queueSpy).toHaveBeenCalledOnce();
-      const prompt = queueSpy.mock.calls[0]?.[0] as string;
+      expect(sendMessageSpy).toHaveBeenCalledOnce();
+      const prompt = sendMessageSpy.mock.calls[0]?.[0] as string;
       expect(prompt).toContain('user: what is the weather like on the moon?');
       expect(prompt).toContain('already visible');
     } finally {
-      queueSpy.mockRestore();
+      sendMessageSpy.mockRestore();
     }
   });
 
@@ -416,22 +416,23 @@ describe('Subconscious remind', () => {
       });
     }
 
-    /** Runs the hook with the lane's `queueMessage` stubbed, so the assertions are about wiring, not model output. */
+    /** Runs the hook with the conversation's `sendMessage` stubbed, so assertions cover wiring rather than model output. */
     async function runWithGenerateSpy(options: {
       createRemindMemory?: () => any;
       threadId?: string;
       response?: string;
     }) {
       const { Agent } = await import('@mastra/core/agent');
-      const generateSpy = vi.spyOn(Agent.prototype, 'queueMessage' as any).mockImplementation(function (
-        this: unknown,
-        _prompt: unknown,
-        opts: any,
-      ) {
-        // Resolve the lane waiter the way a finished run would: through the queued entry's
-        // onFinish stream option.
-        opts?.ifIdle?.streamOptions?.onFinish?.({ text: options.response ?? '<no-reminder />' });
-        return { accepted: Promise.resolve({ action: 'wake' }) };
+      const generateSpy = vi.spyOn(Agent.prototype, 'sendMessage' as any).mockImplementation(function () {
+        return {
+          accepted: Promise.resolve({
+            action: 'wake',
+            output: {
+              consumeStream: vi.fn().mockResolvedValue(undefined),
+              getFullOutput: vi.fn().mockResolvedValue({ text: options.response ?? '<no-reminder />' }),
+            },
+          }),
+        };
       } as any);
       try {
         const extractor = new SubconsciousRemindExtractor({ name: 'remind', maxSteps: 3, builtIn: true }, undefined, {
@@ -506,7 +507,7 @@ describe('Subconscious remind', () => {
       const { result, calls, agents } = await runWithGenerateSpy({});
 
       expect(result.failures).toBeUndefined();
-      // The turn still enters the serialized lane thread; only history persistence is absent.
+      // The turn still enters the serialized conversation thread; only history persistence is absent.
       expect((calls[0]?.[1] as any).threadId).toBe('subconscious:alpha:remind');
       expect(await (agents[0] as any).getMemory()).toBeUndefined();
     });
@@ -747,7 +748,7 @@ describe('Subconscious remind', () => {
   });
 });
 
-describe('Subconscious remind ask lane', () => {
+describe('Subconscious remind ask conversation', () => {
   function createAskTool(
     options: {
       response?: string;
@@ -757,23 +758,31 @@ describe('Subconscious remind ask lane', () => {
     } = {},
   ) {
     const memory = { storage: new InMemoryStore(), getKnowledgeSemanticIndex: vi.fn() } as any;
-    // Asks are delivered with sendMessage. The stub stands in for the lane run: it reads the
-    // correlation id off the delivered message and answers it the only way a real run can — by
-    // calling the reply tool the agent carries. Nothing here resolves a request directly.
+    // Asks are delivered with sendMessage. The stub exercises the real current-input processor,
+    // then answers with the reply tool that processor exposes for this correlated question.
     const generateSpy = vi.spyOn(Agent.prototype, 'sendMessage' as any);
-    generateSpy.mockImplementation(function (this: any, input: any, opts: any) {
-      const accepted = (async () => {
+    generateSpy.mockImplementation(function (this: Agent, input: any, opts: any) {
+      void (async () => {
         const text = options.generate
           ? (await options.generate(input?.contents as string, opts)).text
           : (options.response ?? 'That happened on Tuesday.');
-        const tools = await this.listTools();
-        await tools.reply_to_memory_question.execute(
+        const processor = createReplyToolProcessor(registry, {
+          remindThreadId: opts?.threadId,
+          resourceId: opts?.resourceId,
+        });
+        const processed = await processor.processInputStep?.({ messages: [input], tools: {} } as any);
+        if (!processed || !('tools' in processed)) return;
+        const replyTool = processed.tools?.reply_to_memory_question as any;
+        if (!replyTool) return;
+        await replyTool.execute(
           { correlationId: input?.metadata?.correlationId, answer: text },
-          { agent: { threadId: opts?.threadId, resourceId: opts?.resourceId } },
+          {
+            requestContext: opts?.requestContext,
+            agent: { threadId: opts?.threadId, resourceId: opts?.resourceId },
+          },
         );
-        return { action: 'wake', runId: 'run-stub' };
-      })();
-      return { accepted };
+      })().catch(() => {});
+      return { accepted: Promise.resolve({ action: 'deliver', runId: 'run-stub' }) };
     } as any);
     const registry = new RemindRequestRegistry();
     const tools = createRemindAskTool({
@@ -789,9 +798,13 @@ describe('Subconscious remind ask lane', () => {
   function askContext(overrides: Record<string, unknown> = {}) {
     const requestContext = new RequestContext();
     requestContext.set('organizationId', 'acme');
+    const sourceAgent = {
+      sendSignal: vi.fn(() => ({ accepted: Promise.resolve({ action: 'deliver' }) })),
+    };
     return {
       agent: { agentId: 'main', threadId: 'alpha', resourceId: 'user-42' },
       requestContext,
+      mastra: { getAgentById: vi.fn(async () => sourceAgent) },
       ...overrides,
     } as any;
   }
@@ -815,24 +828,26 @@ describe('Subconscious remind ask lane', () => {
     for (let i = 0; i < 5; i++) await new Promise(resolve => setTimeout(resolve, 0));
   }
 
-  it('answers when the observational memory model is the default sentinel', async () => {
+  it('accepts a question when the observational memory model is the default sentinel', async () => {
     const { tools, generateSpy } = createAskTool({ omModel: 'default', response: 'Answered on the default model.' });
     try {
       const result: any = await tools.ask_memory.execute!({ question: 'what happened?' } as any, askContext());
       expect(result.ok).toBe(true);
-      expect(result.answer).toBe('Answered on the default model.');
+      expect(result.accepted).toBe(true);
+      expect(result.status).toBe('replied');
     } finally {
       generateSpy.mockRestore();
     }
   });
 
-  it('answers when the observational memory model routes by input tokens', async () => {
+  it('accepts a question when the observational memory model routes by input tokens', async () => {
     const tiered = new ModelByInputTokens({ upTo: { 1000: 'openai/gpt-5-nano', 100000: 'openai/gpt-5' } });
     const { tools, generateSpy } = createAskTool({ omModel: tiered, response: 'Answered on the tiered model.' });
     try {
       const result: any = await tools.ask_memory.execute!({ question: 'what happened?' } as any, askContext());
       expect(result.ok).toBe(true);
-      expect(result.answer).toBe('Answered on the tiered model.');
+      expect(result.accepted).toBe(true);
+      expect(result.status).toBe('replied');
     } finally {
       generateSpy.mockRestore();
     }
@@ -854,52 +869,37 @@ describe('Subconscious remind ask lane', () => {
     );
   });
 
-  it('routes the reminder lane model by tier, clamping past the largest threshold', async () => {
+  it('uses the smallest observational-memory tier without guessing prompt size', async () => {
     const config = { name: 'remind', maxSteps: 3, builtIn: true } as any;
     const tiered = new ModelByInputTokens({ upTo: { 1000: 'openai/gpt-5-nano', 100000: 'openai/gpt-5' } });
-    // A small estimate takes the small tier; a bigger one crosses to the larger tier.
-    await expect(resolveReminderLaneModel({ config, omModel: tiered, estimatedInputTokens: 100 })).resolves.toBe(
-      'openai/gpt-5-nano',
-    );
-    await expect(resolveReminderLaneModel({ config, omModel: tiered, estimatedInputTokens: 5000 })).resolves.toBe(
-      'openai/gpt-5',
-    );
-    // Past every threshold the lane clamps to the largest tier instead of throwing: an oversized
-    // reminder turn should degrade, not fail the observation cycle.
-    await expect(resolveReminderLaneModel({ config, omModel: tiered, estimatedInputTokens: 999999 })).resolves.toBe(
-      'openai/gpt-5',
-    );
+    await expect(resolveReminderConversationModel({ config, omModel: tiered })).resolves.toBe('openai/gpt-5-nano');
   });
 
   it('passes failover arrays and dynamic model configs to the reminder agent unreduced', async () => {
     const config = { name: 'remind', maxSteps: 3, builtIn: true } as any;
     const failover = [{ model: 'openai/gpt-5' }, { model: 'openai/gpt-5-nano' }] as any;
-    await expect(
-      resolveReminderLaneModel({ config: { ...config, model: failover }, estimatedInputTokens: 10 }),
-    ).resolves.toBe(failover);
+    await expect(resolveReminderConversationModel({ config: { ...config, model: failover } })).resolves.toBe(failover);
     const dynamic = (() => 'openai/gpt-5') as any;
-    await expect(
-      resolveReminderLaneModel({ config: { ...config, model: dynamic }, estimatedInputTokens: 10 }),
-    ).resolves.toBe(dynamic);
+    await expect(resolveReminderConversationModel({ config: { ...config, model: dynamic } })).resolves.toBe(dynamic);
   });
 
-  it('rejects immediately when the lane refuses the turn as blocked', async () => {
+  it('rejects immediately when the conversation refuses the turn as blocked', async () => {
     const { tools, generateSpy } = createAskTool({});
     // A blocked disposition means the turn will never run: the waiter must fail now, not after
-    // the full lane deadline.
+    // the full conversation deadline.
     generateSpy.mockImplementation((() => ({
       accepted: Promise.resolve({ action: 'blocked', reason: 'thread-blocked' }),
     })) as any);
     try {
       const result: any = await tools.ask_memory.execute!({ question: 'when?' } as any, askContext());
       expect(result.ok).toBe(false);
-      expect(result.error).toMatch(/refused this turn.*thread-blocked/);
+      expect(result.error).toBe('thread-blocked');
     } finally {
       generateSpy.mockRestore();
     }
   });
 
-  it('rejects a blocking ask immediately when the lane run fails after starting', async () => {
+  it('rejects a blocking ask immediately when the conversation run fails after starting', async () => {
     const { tools, generateSpy } = createAskTool({});
     // A post-start failure reports through onError, and it fires BEFORE `accepted` names the run —
     // the failure has to wait for the run id and then land, rather than stranding the question until
@@ -917,34 +917,31 @@ describe('Subconscious remind ask lane', () => {
     }
   });
 
-  it('stops a blocking ask waiting when the calling turn aborts, without failing the lane', async () => {
+  it('keeps an accepted question alive when the calling turn aborts', async () => {
     const { tools, generateSpy } = createAskTool({});
-    // The lane turn never finishes on its own; only the abort should release the caller.
     generateSpy.mockImplementation((() => ({ accepted: Promise.resolve({ action: 'deliver' }) })) as any);
     const controller = new AbortController();
     try {
-      const pending = tools.ask_memory.execute!(
+      const result: any = await tools.ask_memory.execute!(
         { question: 'when?' } as any,
         askContext({ abortSignal: controller.signal }),
       );
-      // Abort AFTER the turn is queued so the listener path is exercised, not the
-      // already-aborted upfront check.
-      await new Promise(resolve => setTimeout(resolve, 0));
       controller.abort();
-      const result: any = await pending;
-      expect(result.ok).toBe(false);
-      expect(result.error).toMatch(/aborted while waiting/);
+      expect(result.ok).toBe(true);
+      expect(result.accepted).toBe(true);
+      expect(result.status).toBe('pending');
     } finally {
       generateSpy.mockRestore();
     }
   });
 
-  it('returns the answer as the tool result when wait is true', async () => {
+  it('acknowledges the question instead of returning the answer inline', async () => {
     const { tools, generateSpy } = createAskTool({ response: 'The deploy happened on Tuesday.' });
     try {
       const result: any = await tools.ask_memory.execute!({ question: 'when did that happen?' } as any, askContext());
       expect(result.ok).toBe(true);
-      expect(result.answer).toBe('The deploy happened on Tuesday.');
+      expect(result.accepted).toBe(true);
+      expect(result).not.toHaveProperty('answer');
     } finally {
       generateSpy.mockRestore();
     }
@@ -981,7 +978,7 @@ describe('Subconscious remind ask lane', () => {
     const capture = signalCapture();
     try {
       const result: any = await tools.ask_memory.execute!(
-        { question: 'when?', wait: false } as any,
+        { question: 'when?' } as any,
         askContext({ mastra: capture.mastra }),
       );
       expect(result.accepted).toBe(true);
@@ -1000,7 +997,7 @@ describe('Subconscious remind ask lane', () => {
     const { tools, generateSpy } = createAskTool({ response: 'Tuesday.' });
     try {
       const result: any = await tools.ask_memory.execute!(
-        { question: 'when?', wait: false } as any,
+        { question: 'when?' } as any,
         askContext({
           mastra: {
             getAgentById: vi.fn(async () => {
@@ -1020,21 +1017,24 @@ describe('Subconscious remind ask lane', () => {
     const { tools, generateSpy } = createAskTool({ response: 'Tuesday.' });
     const capture = signalCapture();
     try {
-      await tools.ask_memory.execute!(
-        { question: 'when?', wait: false } as any,
-        askContext({ mastra: capture.mastra }),
-      );
+      await tools.ask_memory.execute!({ question: 'when?' } as any, askContext({ mastra: capture.mastra }));
       await settle();
       expect(capture.sent[0]).toEqual(
         expect.objectContaining({
           type: 'reactive',
           tagName: 'remembered',
-          attributes: expect.objectContaining({ source: 'subconscious', agent: 'remind', threadId: 'alpha' }),
+          attributes: expect.objectContaining({
+            source: 'subconscious',
+            agent: 'remind',
+            sourceThreadId: 'alpha',
+            sourceResourceId: 'user-42',
+          }),
         }),
       );
       expect(capture.sender.sendSignal).toHaveBeenCalledWith(expect.anything(), {
         threadId: 'alpha',
         resourceId: 'user-42',
+        ifIdle: expect.objectContaining({ behavior: 'wake' }),
       });
     } finally {
       generateSpy.mockRestore();
@@ -1046,7 +1046,7 @@ describe('Subconscious remind ask lane', () => {
     const capture = signalCapture();
     try {
       const result: any = await tools.ask_memory.execute!(
-        { question: 'when?', wait: false } as any,
+        { question: 'when?' } as any,
         askContext({ mastra: capture.mastra }),
       );
       await settle();
@@ -1075,7 +1075,7 @@ describe('Subconscious remind ask lane', () => {
     }
   });
 
-  it('isolates a blocking failure into an error result instead of throwing', async () => {
+  it('acknowledges accepted delivery without waiting for the reminder model', async () => {
     const { tools, generateSpy } = createAskTool({
       generate: async () => {
         throw new Error('reminder provider unavailable');
@@ -1083,45 +1083,30 @@ describe('Subconscious remind ask lane', () => {
     });
     try {
       const result: any = await tools.ask_memory.execute!({ question: 'when?' } as any, askContext());
-      expect(result).toEqual(expect.objectContaining({ ok: false, error: 'reminder provider unavailable' }));
+      expect(result).toEqual(expect.objectContaining({ ok: true, accepted: true, status: 'pending' }));
+      await settle();
     } finally {
       generateSpy.mockRestore();
     }
   });
 
-  it('reports a non-blocking failure on the signal channel carrying the correlation id', async () => {
-    const { tools, generateSpy } = createAskTool({
+  it('does not fabricate a terminal signal when the accepted reminder run later fails', async () => {
+    const { tools, generateSpy, registry } = createAskTool({
       generate: async () => {
         throw new Error('reminder provider unavailable');
       },
     });
     const capture = signalCapture();
-    // A writer whose turn already ended rejects; that must not escape as an unhandled rejection.
-    const writer = {
-      custom: vi.fn(async () => {
-        throw new Error('stream closed');
-      }),
-    };
-    const unhandled: unknown[] = [];
-    const onUnhandled = (reason: unknown) => unhandled.push(reason);
-    process.on('unhandledRejection', onUnhandled);
     try {
       const result: any = await tools.ask_memory.execute!(
-        { question: 'when?', wait: false } as any,
-        askContext({ mastra: capture.mastra, writer }),
+        { question: 'when?' } as any,
+        askContext({ mastra: capture.mastra }),
       );
       await settle();
-      expect(writer.custom).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'data-subconscious-error',
-          data: expect.objectContaining({ agent: 'remind' }),
-        }),
-      );
-      expect(capture.sent[0].attributes.correlationId).toBe(result.correlationId);
-      expect(capture.sent[0].contents).toEqual(expect.anything());
-      expect(unhandled.map(String).filter(reason => reason.includes('stream closed'))).toEqual([]);
+      expect(result).toEqual(expect.objectContaining({ ok: true, accepted: true, status: 'pending' }));
+      expect(capture.sent).toEqual([]);
+      expect(registry.get(result.correlationId)?.status).toBe('pending');
     } finally {
-      process.off('unhandledRejection', onUnhandled);
       generateSpy.mockRestore();
     }
   });
@@ -1134,14 +1119,14 @@ describe('Subconscious remind ask lane', () => {
     try {
       const context = askContext({ mastra: capture.mastra });
       const [one, two]: any[] = await Promise.all([
-        tools.ask_memory.execute!({ question: 'the first one?', wait: false } as any, context),
-        tools.ask_memory.execute!({ question: 'the second one?', wait: false } as any, context),
+        tools.ask_memory.execute!({ question: 'the first one?' } as any, context),
+        tools.ask_memory.execute!({ question: 'the second one?' } as any, context),
       ]);
       await settle();
       expect(one.correlationId).not.toBe(two.correlationId);
       const byId = new Map(capture.sent.map(signal => [signal.attributes.correlationId, signal]));
-      expect(byId.get(one.correlationId)?.attributes.question).toBe('the first one?');
-      expect(byId.get(two.correlationId)?.attributes.question).toBe('the second one?');
+      expect(byId.get(one.correlationId)?.contents).toBe('answer one');
+      expect(byId.get(two.correlationId)?.contents).toBe('answer two');
     } finally {
       generateSpy.mockRestore();
     }
@@ -1169,31 +1154,45 @@ describe('Subconscious remind ask lane', () => {
 
     let releaseAsk: (value: { text: string }) => void = () => {};
     const pendingAsk = new Promise<{ text: string }>(resolve => (releaseAsk = resolve));
+    const registry = new RemindRequestRegistry();
     const tools = createRemindAskTool({
       memory: context.memory,
       config: { name: 'remind', maxSteps: 3, builtIn: true },
       omModel: createModel('unused'),
       createRemindMemory: () => ({}) as any,
+      registry,
     });
     // The passive reply cites the item id: the grounded-citation guard suppresses
     // reminders that reference no candidate, and this test is about signal shape.
-    // The two entry points share the lane but not the completion path: a passive evaluation is
-    // still a run whose text IS the reminder, while a question is only answered by the reply tool.
-    const generateSpy = vi.spyOn(Agent.prototype, 'queueMessage' as any);
-    generateSpy.mockImplementation(((_prompt: string, opts: any) => {
-      opts?.ifIdle?.streamOptions?.onFinish?.({ text: `Atlas ships mid January, worth checking. (${item.id})` });
-      return { accepted: Promise.resolve({ action: 'wake' }) };
-    }) as any);
-    const askSpy = vi.spyOn(Agent.prototype, 'sendMessage' as any);
-    askSpy.mockImplementation(function (this: any, input: any, opts: any) {
+    // Both entry points use sendMessage on the shared reminder conversation. Passive work owns its
+    // output; question work is accepted immediately and can only answer through the bound reply tool.
+    const sendSpy = vi.spyOn(Agent.prototype, 'sendMessage' as any);
+    sendSpy.mockImplementation(function (_input: any, opts: any) {
+      const input = _input as { metadata?: Record<string, unknown> } | string;
+      if (typeof input === 'string') {
+        return {
+          accepted: Promise.resolve({
+            action: 'wake',
+            output: {
+              consumeStream: vi.fn(async () => {}),
+              getFullOutput: vi.fn(async () => ({ text: `Atlas ships mid January, worth checking. (${item.id})` })),
+            },
+          }),
+        };
+      }
       void pendingAsk.then(async answer => {
-        const agentTools = await this.listTools();
-        await agentTools.reply_to_memory_question.execute(
-          { correlationId: input?.metadata?.correlationId, answer: answer.text },
+        const processor = createReplyToolProcessor(registry, {
+          remindThreadId: opts?.threadId,
+          resourceId: opts?.resourceId,
+        });
+        const processed = await processor.processInputStep?.({ messages: [input], tools: {} } as any);
+        if (!processed || !('tools' in processed)) return;
+        await (processed.tools?.reply_to_memory_question as any).execute(
+          { correlationId: input.metadata?.correlationId, answer: answer.text },
           { agent: { threadId: opts?.threadId, resourceId: opts?.resourceId } },
         );
       });
-      return { accepted: Promise.resolve({ action: 'wake', runId: 'run-ask' }) };
+      return { accepted: Promise.resolve({ action: 'deliver', runId: 'run-ask' }) };
     } as any);
 
     try {
@@ -1224,11 +1223,17 @@ describe('Subconscious remind ask lane', () => {
         }),
       );
 
+      const acknowledgement: any = await askInFlight;
+      expect(acknowledgement).toEqual(
+        expect.objectContaining({ ok: true, accepted: true, status: 'pending', correlationId: expect.any(String) }),
+      );
       releaseAsk({ text: 'January 15.' });
-      expect(await askInFlight).toEqual(expect.objectContaining({ ok: true, answer: 'January 15.' }));
+      await vi.waitFor(() => expect(registry.get(acknowledgement.correlationId)?.status).toBe('replied'));
+      const targets = sendSpy.mock.calls.map(([, target]: any[]) => target);
+      expect(targets).toHaveLength(2);
+      expect(targets.every(target => target.threadId === 'subconscious:alpha:remind')).toBe(true);
     } finally {
-      generateSpy.mockRestore();
-      askSpy.mockRestore();
+      sendSpy.mockRestore();
     }
   });
 
@@ -1246,7 +1251,7 @@ describe('Subconscious remind ask lane', () => {
   });
 });
 
-describe('reminder lane serialization (real runtime)', () => {
+describe('reminder conversation serialization (real runtime)', () => {
   // Tyler's review repro: two concurrent asks against the shared remind conversation must not
   // interleave. This test uses the REAL Agent + thread-stream runtime + Memory over shared
   // storage — no queueMessage spies — so it proves the runtime contract, not a mock of it.
@@ -1277,7 +1282,7 @@ describe('reminder lane serialization (real runtime)', () => {
           return {
             stream: convertArrayToReadableStream([
               { type: 'stream-start', warnings: [] },
-              { type: 'response-metadata', id: 'lane-done', modelId: 'remind-model', timestamp: new Date() },
+              { type: 'response-metadata', id: 'conversation-done', modelId: 'remind-model', timestamp: new Date() },
               { type: 'finish', finishReason: 'stop', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } },
             ]),
             rawCall: { rawPrompt: null, rawSettings: {} },
@@ -1287,14 +1292,14 @@ describe('reminder lane serialization (real runtime)', () => {
         const index = streamCalls++;
         if (index === 0) await firstGate;
         repliedTo.add(correlationId);
-        // The lane thread carries every earlier question too, so the answer is chosen from the
+        // The conversation thread carries every earlier question too, so the answer is chosen from the
         // question that owns the OPEN correlation id — not from whatever text is in scrollback.
         const asked = new RegExp(`correlationId: ${correlationId}[^:]*: (first|second) question`).exec(transcript)?.[1];
         const text = `answer-${asked}`;
         return {
           stream: convertArrayToReadableStream([
             { type: 'stream-start', warnings: [] },
-            { type: 'response-metadata', id: `lane-${index}`, modelId: 'remind-model', timestamp: new Date() },
+            { type: 'response-metadata', id: `conversation-${index}`, modelId: 'remind-model', timestamp: new Date() },
             { type: 'text-start', id: 'text-1' },
             { type: 'text-delta', id: 'text-1', delta: text },
             { type: 'text-end', id: 'text-1' },
@@ -1323,14 +1328,25 @@ describe('reminder lane serialization (real runtime)', () => {
       omModel: model as any,
       createRemindMemory: () => remindMemory as any,
     });
+    const sent: any[] = [];
+    const sourceAgent = {
+      sendSignal: vi.fn((signal: any) => {
+        sent.push(signal);
+        return { accepted: Promise.resolve({ action: 'deliver' }) };
+      }),
+    };
     const context = () => {
       const requestContext = new RequestContext();
       requestContext.set('organizationId', 'acme');
-      return { agent: { agentId: 'main', threadId: 'alpha', resourceId: 'user-42' }, requestContext } as any;
+      return {
+        agent: { agentId: 'main', threadId: 'alpha', resourceId: 'user-42' },
+        requestContext,
+        mastra: { getAgentById: vi.fn(async () => sourceAgent) },
+      } as any;
     };
 
     const first = tools.ask_memory.execute!({ question: 'first question' } as any, context());
-    // Wait for the first run to actually reach the model (run active on the lane thread).
+    // Wait for the first run to actually reach the model (run active on the conversation thread).
     await vi.waitFor(() => expect(streamCalls).toBeGreaterThan(0), { timeout: 10_000 });
     const second = tools.ask_memory.execute!({ question: 'second question' } as any, context());
     // Give the runtime a beat to route the second ask while the first is mid-stream, then
@@ -1340,16 +1356,20 @@ describe('reminder lane serialization (real runtime)', () => {
     releaseFirst();
 
     const [firstResult, secondResult] = (await Promise.all([first, second])) as any[];
-    expect(firstResult).toEqual(expect.objectContaining({ ok: true, answer: 'answer-first' }));
-    expect(secondResult).toEqual(expect.objectContaining({ ok: true, answer: 'answer-second' }));
+    expect(firstResult).toEqual(expect.objectContaining({ ok: true, accepted: true, status: 'pending' }));
+    expect(secondResult).toEqual(expect.objectContaining({ ok: true, accepted: true, status: 'pending' }));
+    await vi.waitFor(() => expect(sent).toHaveLength(2), { timeout: 10_000 });
+    const answers = new Map(sent.map(signal => [signal.attributes.correlationId, signal.contents]));
+    expect(answers.get(firstResult.correlationId)).toBe('answer-first');
+    expect(answers.get(secondResult.correlationId)).toBe('answer-second');
 
     // The persisted transcript is the contract: question, its answer, next question, its answer.
-    // Queued lane entries persist with the runtime's signal role rather than user — the causal
+    // Queued conversation entries persist with the runtime's signal role rather than user — the causal
     // pairing, not the role label, is what the concurrency bug corrupted.
     const memoryStore = await (
       remindMemory as unknown as { getMemoryStore(): Promise<MemoryStorage> }
     ).getMemoryStore();
-    // The reply tool settles the asker before the lane run finishes writing its own turn, so the
+    // The reply tool settles the asker before the conversation run finishes writing its own turn, so the
     // transcript lands slightly after the answers do — wait for the run's persistence, not a sleep.
     const messages = await vi.waitFor(
       async () => {
@@ -1368,7 +1388,7 @@ describe('reminder lane serialization (real runtime)', () => {
       return `${message.role}:${text.includes('first question') ? 'first' : text.includes('second question') ? 'second' : text}`;
     });
     expect(transcript).toEqual(['signal:first', 'assistant:answer-first', 'signal:second', 'assistant:answer-second']);
-  });
+  }, 30_000);
 });
 
 describe('correlated request lifecycle (real runtime)', () => {
@@ -1379,7 +1399,7 @@ describe('correlated request lifecycle (real runtime)', () => {
   const openIds = (transcript: string) =>
     [...transcript.matchAll(/correlationId: (remind-ask-[0-9a-f-]+)/g)].map(m => m[1]!);
 
-  let laneSeq = 0;
+  let conversationSeq = 0;
 
   const silentTurn = (id: string) => ({
     stream: convertArrayToReadableStream([
@@ -1410,12 +1430,30 @@ describe('correlated request lifecycle (real runtime)', () => {
     warnings: [],
   });
 
-  async function lane(options: { doStream: ScriptedStream; registry?: RemindRequestRegistry; maxSteps?: number }) {
+  async function currentInputTools(agent: Agent, input: any) {
+    let tools: Record<string, any> = {};
+    for (const processor of await agent.listConfiguredInputProcessors()) {
+      if (!('processInputStep' in processor) || !processor.processInputStep) continue;
+      const result = await processor.processInputStep({
+        messages: [{ metadata: input?.metadata, content: input?.contents ?? input?.content }],
+        tools,
+      } as any);
+      if (result && !Array.isArray(result) && 'tools' in result && result.tools)
+        tools = result.tools as Record<string, any>;
+    }
+    return tools;
+  }
+
+  async function reminderConversation(options: {
+    doStream: ScriptedStream;
+    registry?: RemindRequestRegistry;
+    maxSteps?: number;
+  }) {
     const { Memory } = await import('../../../index');
     // Each case gets its own parent thread: reminder agents are keyed by it, so sharing one would let
-    // a previous case's still-live lane run answer this case's questions.
-    laneSeq += 1;
-    const parentThreadId = `alpha-${laneSeq}`;
+    // a previous case's still-live conversation run answer this case's questions.
+    conversationSeq += 1;
+    const parentThreadId = `alpha-${conversationSeq}`;
     const remindMemory = new Memory({ storage: new InMemoryStore() });
     const tools = createRemindAskTool({
       memory: { storage: new InMemoryStore(), getKnowledgeSemanticIndex: vi.fn() } as any,
@@ -1428,7 +1466,7 @@ describe('correlated request lifecycle (real runtime)', () => {
     const signalAgent = {
       sendSignal: (signal: any) => {
         sent.push(signal);
-        return { persisted: Promise.resolve() };
+        return { accepted: Promise.resolve({ action: 'deliver' }), persisted: Promise.resolve() };
       },
     };
     const context = (extra: Record<string, unknown> = {}) => {
@@ -1466,7 +1504,7 @@ describe('correlated request lifecycle (real runtime)', () => {
     let openWhenAnswered = 0;
     let pokes = 0;
     let step = 0;
-    const { tools, context } = await lane({
+    const { tools, context, sent } = await reminderConversation({
       maxSteps: 12,
       doStream: async ({ prompt }: any) => {
         const open = openIds(JSON.stringify(prompt)).filter(id => !replied.has(id));
@@ -1495,16 +1533,18 @@ describe('correlated request lifecycle (real runtime)', () => {
     release();
 
     const [a, b] = (await Promise.all([first, second])) as any[];
+    expect(a).toEqual(expect.objectContaining({ ok: true, accepted: true, status: 'pending' }));
+    expect(b).toEqual(expect.objectContaining({ ok: true, accepted: true, status: 'pending' }));
+    await vi.waitFor(() => expect(sent).toHaveLength(2), { timeout: 10_000 });
     // Without this the rest of the assertions also hold when the two questions never met in one run.
     expect(openWhenAnswered).toBe(2);
-    expect(a.status).toBe('replied');
-    expect(b.status).toBe('replied');
-    expect(a.answer).toBe(`answer-for-${a.correlationId}`);
-    expect(b.answer).toBe(`answer-for-${b.correlationId}`);
+    const answers = new Map(sent.map(signal => [signal.attributes.correlationId, signal.contents]));
+    expect(answers.get(a.correlationId)).toBe(`answer-for-${a.correlationId}`);
+    expect(answers.get(b.correlationId)).toBe(`answer-for-${b.correlationId}`);
     expect(a.correlationId).not.toBe(b.correlationId);
   }, 30_000);
 
-  it('settles delivery_failed instead of leaking a pending request when building the lane agent throws', async () => {
+  it('settles delivery_failed instead of leaking a pending request when building the conversation agent throws', async () => {
     // `createRemindMemory` touches real storage, so it can throw before anything is dispatched. The
     // correlation id is minted first by design, which means a throw on the way to the transport must
     // still land on that id — otherwise the caller gets an error while the registry holds a pending
@@ -1571,7 +1611,7 @@ describe('correlated request lifecycle (real runtime)', () => {
     const sent: any[] = [];
 
     const result: any = await tools.ask_memory.execute!(
-      { question: 'anything', wait: false } as any,
+      { question: 'anything' } as any,
       {
         agent: { agentId: 'main', threadId: 'detached-dead', resourceId: 'user-42' },
         requestContext,
@@ -1594,9 +1634,9 @@ describe('correlated request lifecycle (real runtime)', () => {
     expect(sent).toHaveLength(0);
   });
 
-  it('sends blocking and detached questions down the same dispatch path', async () => {
+  it('sends every accepted question down the same dispatch path', async () => {
     const seen: string[] = [];
-    const { tools, context, sent, parentThreadId, remindThreadId } = await lane({
+    const { tools, context, sent, parentThreadId, remindThreadId } = await reminderConversation({
       doStream: async ({ prompt }: any) => {
         const transcript = JSON.stringify(prompt);
         const ids = openIds(transcript);
@@ -1608,24 +1648,29 @@ describe('correlated request lifecycle (real runtime)', () => {
     });
     const sendSpy = vi.spyOn(Agent.prototype, 'sendMessage');
     try {
-      const blocking: any = await tools.ask_memory.execute!({ question: 'blocking' } as any, context());
-      const detached: any = await tools.ask_memory.execute!({ question: 'detached', wait: false } as any, context());
+      const first: any = await tools.ask_memory.execute!({ question: 'first' } as any, context());
+      const second: any = await tools.ask_memory.execute!({ question: 'second' } as any, context());
 
       // Both modes went through sendMessage with the same shape: identity in the visible content AND
-      // the structured metadata, addressed to the shared lane.
+      // the structured metadata, addressed to the shared conversation.
       expect(sendSpy).toHaveBeenCalledTimes(2);
       for (const [input, target] of sendSpy.mock.calls as any[]) {
         expect(input.metadata).toEqual(expect.objectContaining({ kind: 'remind-ask', parentThreadId, remindThreadId }));
         expect(input.contents).toContain(input.metadata.correlationId);
         expect(target).toEqual(expect.objectContaining({ threadId: remindThreadId, resourceId: 'user-42' }));
       }
-      expect(blocking.status).toBe('replied');
-      expect(detached).toEqual(
+      expect(first).toEqual(
         expect.objectContaining({ ok: true, accepted: true, status: 'pending', correlationId: expect.any(String) }),
       );
-      // The detached answer lands later on the same id — one delivery, no fabricated answer up front.
+      expect(second).toEqual(
+        expect.objectContaining({ ok: true, accepted: true, status: 'pending', correlationId: expect.any(String) }),
+      );
+      // Both answers land later on their own ids — one delivery each, no fabricated answer up front.
       await vi.waitFor(
-        () => expect(sent.filter(s => s.attributes?.correlationId === detached.correlationId)).toHaveLength(1),
+        () => {
+          expect(sent.filter(s => s.attributes?.correlationId === first.correlationId)).toHaveLength(1);
+          expect(sent.filter(s => s.attributes?.correlationId === second.correlationId)).toHaveLength(1);
+        },
         { timeout: 10_000 },
       );
     } finally {
@@ -1635,7 +1680,7 @@ describe('correlated request lifecycle (real runtime)', () => {
 
   it('keeps one terminal result when the model replies twice, and rejects unknown or completed ids', async () => {
     const replies: Record<string, number> = {};
-    const { tools, context, sent } = await lane({
+    const { tools, context, sent } = await reminderConversation({
       doStream: async ({ prompt }: any) => {
         const transcript = JSON.stringify(prompt);
         const id = openIds(transcript).pop()!;
@@ -1647,7 +1692,7 @@ describe('correlated request lifecycle (real runtime)', () => {
       },
     });
 
-    const detached: any = await tools.ask_memory.execute!({ question: 'twice', wait: false } as any, context());
+    const detached: any = await tools.ask_memory.execute!({ question: 'twice' } as any, context());
     await vi.waitFor(
       () => expect(sent.filter(s => s.attributes?.correlationId === detached.correlationId).length).toBeGreaterThan(0),
       { timeout: 10_000 },
@@ -1656,17 +1701,21 @@ describe('correlated request lifecycle (real runtime)', () => {
     // Barrier: a full round trip through the same runtime AFTER the first delivery. A delayed second
     // terminal event would have to land before this completes, so silence afterwards is real.
     const barrier: any = await tools.ask_memory.execute!({ question: 'barrier' } as any, context());
-    expect(barrier.status).toBe('replied');
+    expect(barrier.status).toBe('pending');
+    await vi.waitFor(
+      () => expect(sent.filter(s => s.attributes?.correlationId === barrier.correlationId)).toHaveLength(1),
+      { timeout: 10_000 },
+    );
     expect(sent.filter(s => s.attributes?.correlationId === detached.correlationId)).toHaveLength(1);
     expect(replies[detached.correlationId]).toBeGreaterThan(1); // the model really did try twice
   }, 30_000);
 
-  it('times out a question the lane never answers and refuses the late reply', async () => {
-    // Long enough for the lane run to actually reach the model, short enough to expire in-test: the
+  it('times out a question the conversation never answers and refuses the late reply', async () => {
+    // Long enough for the conversation run to actually reach the model, short enough to expire in-test: the
     // deadline must fire on a question the runtime really carried, not on one that never left.
     const registry = new RemindRequestRegistry({ deadlineMs: 2_000 });
     let sawQuestion = false;
-    const { tools, context } = await lane({
+    const { tools, context } = await reminderConversation({
       registry,
       doStream: async ({ prompt }: any) => {
         sawQuestion = openIds(JSON.stringify(prompt)).length > 0;
@@ -1676,43 +1725,49 @@ describe('correlated request lifecycle (real runtime)', () => {
     });
 
     const result: any = await tools.ask_memory.execute!({ question: 'never answered' } as any, context());
-    expect(sawQuestion).toBe(true);
+    await vi.waitFor(() => expect(sawQuestion).toBe(true), { timeout: 10_000 });
     expect(result).toEqual(
-      expect.objectContaining({ ok: false, status: 'timed_out', correlationId: expect.any(String) }),
+      expect.objectContaining({ ok: true, accepted: true, status: 'pending', correlationId: expect.any(String) }),
     );
+    await vi.waitFor(() => expect(registry.get(result.correlationId)?.status).toBe('timed_out'), { timeout: 10_000 });
 
     // The late reply arrives after the deadline: the recorded terminal result stands.
-    const late = registry.complete(result.correlationId, {
-      ok: true,
-      correlationId: result.correlationId,
-      status: 'replied',
-      answer: 'too late',
-    });
+    const record = registry.get(result.correlationId)!;
+    const late = registry.reserveTerminal(result.correlationId, record.conversation);
     expect(late.outcome).toBe('rejected');
     expect(registry.get(result.correlationId)?.status).toBe('timed_out');
   }, 30_000);
 
-  it('fails the question when the lane run fails, including a failure that beats the run id home', async () => {
-    const { tools, context } = await lane({
+  it('records model failure after an accepted question without fabricating an answer', async () => {
+    const registry = new RemindRequestRegistry();
+    const { tools, context, sent } = await reminderConversation({
+      registry,
       doStream: async () => {
         throw new Error('model exploded');
       },
     });
     const result: any = await tools.ask_memory.execute!({ question: 'boom' } as any, context());
-    expect(result.ok).toBe(false);
-    expect(result.status).toBe('model_failed');
-    expect(result.correlationId).toEqual(expect.any(String));
+    expect(result).toEqual(
+      expect.objectContaining({ ok: true, accepted: true, status: 'pending', correlationId: expect.any(String) }),
+    );
+    await vi.waitFor(() => expect(registry.get(result.correlationId)?.status).toBe('model_failed'), {
+      timeout: 10_000,
+    });
+    expect(registry.get(result.correlationId)?.failure?.message).toContain('model exploded');
+    expect(sent).toHaveLength(0);
   }, 30_000);
 
-  it('refuses a reply that comes from outside the lane that owns the question', async () => {
+  it('refuses a reply that comes from outside the reminder conversation that owns the question', async () => {
     // Trusted identity is the execution context, not the model's input: the same well-formed answer
     // is rejected under a foreign thread and accepted under the owning one.
-    const { tools, context, remindThreadId } = await lane({ doStream: async () => silentTurn('never') });
+    const { tools, context, remindThreadId, sent } = await reminderConversation({
+      doStream: async () => silentTurn('never'),
+    });
     let rejected: any;
     const sendSpy = vi.spyOn(Agent.prototype, 'sendMessage' as any);
     sendSpy.mockImplementation(function (this: any, input: any, opts: any) {
       const accepted = (async () => {
-        const agentTools = await this.listTools();
+        const agentTools = await currentInputTools(this, input);
         const correlationId = input?.metadata?.correlationId;
         rejected = await agentTools.reply_to_memory_question.execute(
           { correlationId, answer: 'from the wrong room' },
@@ -1728,21 +1783,27 @@ describe('correlated request lifecycle (real runtime)', () => {
     } as any);
     try {
       const result: any = await tools.ask_memory.execute!({ question: 'whose question is this' } as any, context());
+      expect(result).toEqual(expect.objectContaining({ ok: true, accepted: true, status: 'replied' }));
       expect(rejected).toEqual(expect.objectContaining({ ok: false }));
-      expect(rejected.error).toMatch(/outside the lane/);
-      // The foreign answer never reached the asker; the lane's own answer did.
-      expect(result).toEqual(expect.objectContaining({ ok: true, status: 'replied', answer: 'from the right room' }));
+      expect(rejected.error).toMatch(/another conversation/);
+      await vi.waitFor(() => expect(sent).toHaveLength(1), { timeout: 10_000 });
+      expect(sent[0]).toEqual(
+        expect.objectContaining({
+          contents: 'from the right room',
+          attributes: expect.objectContaining({ correlationId: result.correlationId, status: 'replied' }),
+        }),
+      );
       expect(remindThreadId).toContain(':remind');
     } finally {
       sendSpy.mockRestore();
     }
   }, 30_000);
 
-  it('aborts only the caller that gave up, and leaves the lane run alone', async () => {
+  it('keeps accepted reminder work alive when the calling turn aborts', async () => {
     let release!: () => void;
     const gate = new Promise<void>(resolve => (release = resolve));
     const replied = new Set<string>();
-    const { tools, context } = await lane({
+    const { tools, context, sent } = await reminderConversation({
       doStream: async ({ prompt }: any) => {
         const open = openIds(JSON.stringify(prompt)).filter(id => !replied.has(id));
         if (open.length === 0) return silentTurn('idle');
@@ -1754,26 +1815,28 @@ describe('correlated request lifecycle (real runtime)', () => {
     });
 
     const controller = new AbortController();
-    const abandoned = tools.ask_memory.execute!(
+    const accepted: any = await tools.ask_memory.execute!(
       { question: 'abandoned question' } as any,
       context({ abortSignal: controller.signal }),
     );
-    await new Promise(resolve => setTimeout(resolve, 25));
+    expect(accepted).toEqual(expect.objectContaining({ ok: true, accepted: true, status: 'pending' }));
     controller.abort();
-    const aborted: any = await abandoned;
-    expect(aborted).toEqual(expect.objectContaining({ ok: false, status: 'aborted' }));
-
-    // The lane was not cancelled: a question asked afterwards still gets answered by the same runtime.
     release();
+    await vi.waitFor(
+      () => expect(sent.some(signal => signal.attributes?.correlationId === accepted.correlationId)).toBe(true),
+      { timeout: 10_000 },
+    );
+
+    // Aborting the source turn did not cancel the reminder runtime or its accepted work.
     const next: any = await tools.ask_memory.execute!({ question: 'still working' } as any, context());
-    expect(next.status).toBe('replied');
-    expect(next.correlationId).not.toBe(aborted.correlationId);
+    expect(next).toEqual(expect.objectContaining({ ok: true, accepted: true }));
+    expect(next.correlationId).not.toBe(accepted.correlationId);
   }, 30_000);
 
   it('fails the question when the run dies before sendMessage finishes handing back its run id', async () => {
     // The failure beats `accepted` home. Without the stashed run token the request would sit pending
     // until the deadline instead of reporting the failure that already happened.
-    const { tools, context } = await lane({ doStream: async () => silentTurn('never') });
+    const { tools, context } = await reminderConversation({ doStream: async () => silentTurn('never') });
     const sendSpy = vi.spyOn(Agent.prototype, 'sendMessage' as any);
     sendSpy.mockImplementation(function (this: any, _input: any, opts: any) {
       opts?.ifIdle?.streamOptions?.onError?.({ error: new Error('died on the way out') });
@@ -1795,7 +1858,7 @@ describe('correlated request lifecycle (real runtime)', () => {
     let release!: () => void;
     const gate = new Promise<void>(resolve => (release = resolve));
     const replied = new Set<string>();
-    const { tools, context, sent } = await lane({
+    const { tools, context, sent } = await reminderConversation({
       doStream: async ({ prompt }: any) => {
         const open = openIds(JSON.stringify(prompt)).filter(id => !replied.has(id));
         if (open.length === 0) return silentTurn('idle');
@@ -1808,7 +1871,7 @@ describe('correlated request lifecycle (real runtime)', () => {
 
     const controller = new AbortController();
     const ack: any = await tools.ask_memory.execute!(
-      { question: 'detached and abandoned', wait: false } as any,
+      { question: 'detached and abandoned' } as any,
       context({ abortSignal: controller.signal }),
     );
     expect(ack.status).toBe('pending');
@@ -1824,41 +1887,35 @@ describe('correlated request lifecycle (real runtime)', () => {
     expect(delivered?.attributes?.status).toBe('replied');
   }, 30_000);
 
-  it('rejects unknown, expired and disagreeing replies at the reply tool', async () => {
-    const registry = new RemindRequestRegistry({ retentionMs: 30 });
+  it('rejects unknown replies and deduplicates terminal retries without retaining answer payloads', async () => {
     const outcomes: any[] = [];
-    const { tools, context } = await lane({ registry, doStream: async () => silentTurn('never') });
+    const { tools, context, sent } = await reminderConversation({ doStream: async () => silentTurn('never') });
     const sendSpy = vi.spyOn(Agent.prototype, 'sendMessage' as any);
     sendSpy.mockImplementation(function (this: any, input: any, opts: any) {
       const accepted = (async () => {
-        const agentTools = await this.listTools();
+        const agentTools = await currentInputTools(this, input);
         const correlationId = input?.metadata?.correlationId;
-        const laneCtx = { agent: { threadId: opts?.threadId, resourceId: opts?.resourceId } };
+        const conversationContext = { agent: { threadId: opts?.threadId, resourceId: opts?.resourceId } };
         outcomes.push([
           'unknown',
           await agentTools.reply_to_memory_question.execute(
             { correlationId: 'remind-ask-00000000-0000-4000-8000-000000000000', answer: 'nobody asked' },
-            laneCtx,
+            conversationContext,
           ),
         ]);
         outcomes.push([
           'first',
-          await agentTools.reply_to_memory_question.execute({ correlationId, answer: 'the answer' }, laneCtx),
+          await agentTools.reply_to_memory_question.execute(
+            { correlationId, answer: 'the answer' },
+            conversationContext,
+          ),
         ]);
         outcomes.push([
           'retry',
-          await agentTools.reply_to_memory_question.execute({ correlationId, answer: 'the answer' }, laneCtx),
-        ]);
-        outcomes.push([
-          'conflict',
-          await agentTools.reply_to_memory_question.execute({ correlationId, answer: 'a different answer' }, laneCtx),
-        ]);
-        // Retention lapses; the id is now indistinguishable from one that never existed.
-        await new Promise(resolve => setTimeout(resolve, 60));
-        registry.prune();
-        outcomes.push([
-          'expired',
-          await agentTools.reply_to_memory_question.execute({ correlationId, answer: 'the answer' }, laneCtx),
+          await agentTools.reply_to_memory_question.execute(
+            { correlationId, answer: 'a different answer' },
+            conversationContext,
+          ),
         ]);
         return { action: 'wake', runId: 'run-stub' };
       })();
@@ -1866,24 +1923,22 @@ describe('correlated request lifecycle (real runtime)', () => {
     } as any);
     try {
       const result: any = await tools.ask_memory.execute!({ question: 'protocol errors' } as any, context());
-      expect(result.status).toBe('replied');
-      await vi.waitFor(() => expect(outcomes).toHaveLength(5), { timeout: 10_000 });
+      expect(result).toEqual(expect.objectContaining({ ok: true, accepted: true, status: 'replied' }));
+      await vi.waitFor(() => expect(outcomes).toHaveLength(3), { timeout: 10_000 });
       const byName = Object.fromEntries(outcomes);
       expect(byName.unknown).toEqual(expect.objectContaining({ ok: false }));
-      expect(byName.unknown.error).toMatch(/No open question/);
+      expect(byName.unknown.error).toMatch(/not part of the current reminder input/);
       expect(byName.first).toEqual(expect.objectContaining({ ok: true, delivered: true }));
       expect(byName.retry).toEqual(expect.objectContaining({ ok: true, duplicate: true }));
-      expect(byName.conflict).toEqual(expect.objectContaining({ ok: false }));
-      expect(byName.conflict.error).toMatch(/different result/);
-      expect(byName.expired).toEqual(expect.objectContaining({ ok: false }));
-      expect(byName.expired.error).toMatch(/No open question/);
+      expect(sent).toHaveLength(1);
+      expect(sent[0].contents).toBe('the answer');
     } finally {
       sendSpy.mockRestore();
     }
   }, 30_000);
 
-  it('reports delivery_failed when the lane refuses the message outright', async () => {
-    const { tools, context } = await lane({ doStream: async () => silentTurn('never') });
+  it('reports delivery_failed when the conversation refuses the message outright', async () => {
+    const { tools, context } = await reminderConversation({ doStream: async () => silentTurn('never') });
     const sendSpy = vi.spyOn(Agent.prototype, 'sendMessage').mockReturnValue({
       accepted: Promise.resolve({ action: 'blocked', reason: 'thread-blocked' }),
     } as any);
@@ -1899,7 +1954,7 @@ describe('correlated request lifecycle (real runtime)', () => {
 
   it('persists the correlation id in both the visible message and its metadata', async () => {
     const answered = new Set<string>();
-    const { tools, context, remindMemory, remindThreadId } = await lane({
+    const { tools, context, remindMemory, remindThreadId } = await reminderConversation({
       doStream: async ({ prompt }: any) => {
         const id = openIds(JSON.stringify(prompt)).pop();
         if (!id || answered.has(id)) return silentTurn('idle');
@@ -1908,7 +1963,7 @@ describe('correlated request lifecycle (real runtime)', () => {
       },
     });
     const result: any = await tools.ask_memory.execute!({ question: 'remember me' } as any, context());
-    expect(result.status).toBe('replied');
+    expect(result).toEqual(expect.objectContaining({ ok: true, accepted: true, status: 'pending' }));
 
     const store = await (remindMemory as unknown as { getMemoryStore(): Promise<MemoryStorage> }).getMemoryStore();
     const listed = await vi.waitFor(

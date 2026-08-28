@@ -38,14 +38,15 @@ it('native transport: active source delivery uses the bound source Agent', () =>
 
 it('native transport: idle source delivery can wake through the bound source Agent', () => {
   expectArchitecture(
-    remindSource.includes('ifIdle: { streamOptions:'),
+    /sourceAgent\.sendSignal\([\s\S]*ifIdle:\s*\{[\s\S]*behavior:\s*'wake'[\s\S]*streamOptions:/.test(remindSource),
     'missing direct signal idle wake: source delivery does not provide the source Agent idle-thread wake contract',
   );
 });
 
 it('native transport: source conversation consumes a correlated reactive signal end to end', () => {
   expectArchitecture(
-    remindSource.includes('id: `remind-answer:${correlationId}:terminal`') && remindSource.includes("type: 'reactive'"),
+    requestStateSource.includes('`remind-answer:${correlationId}:terminal`') &&
+      remindSource.includes("type: 'reactive'"),
     'missing direct signal contract: deterministic correlated terminal signal id is absent',
   );
 });
@@ -60,7 +61,7 @@ it('native transport: passive reminders and questions enter through the same con
 it('native transport: reply tooling is scoped to current question input rather than every reminder Agent', () => {
   const agentFactory = remindSource.slice(
     remindSource.indexOf('function createReminderAgent'),
-    remindSource.indexOf('interface ReminderLaneTurnArgs'),
+    remindSource.indexOf('interface ReminderConversationTurnArgs'),
   );
   expect(
     agentFactory,

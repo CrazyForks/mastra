@@ -1,4 +1,5 @@
 import { Agent, createSignal } from '@mastra/core/agent';
+import type { InputProcessor, ProcessInputStepArgs, ProcessInputStepResult } from '@mastra/core/processors';
 import type { RequestContext } from '@mastra/core/request-context';
 import type { KnowledgeScope, KnowledgeStorage, SearchKnowledgeResult } from '@mastra/core/storage';
 import { canonicalizeKnowledgeScope } from '@mastra/core/storage';
@@ -11,9 +12,9 @@ import { Extractor } from '../extractor';
 import type { ObservationalMemoryModel } from '../types';
 import { publishSubconsciousActivity } from './activity';
 import { createKnowledgeTools } from './knowledge-tools';
-import { resolveReminderLaneModel } from './model';
-import type { RemindLane, RemindRequestRecord, RemindRequestResult } from './remind-request-state';
-import { LANE_TURN_DEADLINE_MS, RemindRequestRegistry } from './remind-request-state';
+import { resolveReminderConversationModel } from './model';
+import type { RemindConversation, RemindRequestRecord } from './remind-request-state';
+import { REMINDER_TURN_DEADLINE_MS, RemindRequestRegistry } from './remind-request-state';
 import { resolveKnowledgeResourceId } from './scope';
 import type { ResolvedSubconsciousAgent } from './types';
 
@@ -119,29 +120,29 @@ export function remindThreadKey(parentThreadId: string): string {
 }
 
 /**
- * The resource id the lane runs under. The runtime keys its serialization lane on
+ * The resource id the reminder conversation runs under. The runtime serializes work by
  * `[resourceId, threadId]`, so EVERY entry point must derive the resource identically — asks and
- * passive evaluations resolving different resource ids for the same session would split into two
- * lanes on the same memory thread and interleave. Both paths read the session's resource and fall
- * back to the parent thread id when the session has none.
+ * passive evaluations resolving different resource ids for the same session would split one
+ * memory thread into two execution streams. Both paths read the session's resource and fall back
+ * to the parent thread id when the session has none.
  */
-function laneResourceId(parentThreadId: string, resourceId?: string): string {
+function reminderResourceId(parentThreadId: string, resourceId?: string): string {
   return resourceId ?? parentThreadId;
 }
 
 export interface SubconsciousRemindOptions {
   /**
    * Returns the Memory that backs the reminder agent's own conversation. Called on demand so a
-   * session that never reminds never builds one, and called again for every lane turn rather than
-   * cached: a cached instance would pin the model of whichever session reminded first. Persisted
+   * session that never reminds never builds one, and called again for every reminder turn rather
+   * than cached: a cached instance would pin the model of whichever session reminded first. Persisted
    * continuity is unaffected, because the observational record and its locks are keyed by the thread,
    * not by the instance; only in-process caches are rebuilt with it.
    */
   createRemindMemory?: () => Memory;
   /**
-   * Correlated request registry shared by every reminder agent this Memory creates. A question may be
-   * delivered into an already-running reminder turn, so the run that answers it is not necessarily the
-   * run that received it — only a shared registry can settle the right request.
+   * Correlated lifecycle registry shared by every reminder agent this Memory creates. It records
+   * routing, status, deadlines, and terminal deduplication while answers travel directly through
+   * source-agent signals.
    */
   registry?: RemindRequestRegistry;
 }
@@ -170,8 +171,23 @@ const NO_MODEL_MESSAGE =
   'The reminder agent has no model available at tool call time. Configure a model on the Subconscious remind agent or on observational memory; the main agent model is only reachable from the observation hook.';
 
 type SignalSender = {
-  sendSignal(signal: unknown, target: { threadId: string; resourceId: string }): { persisted?: Promise<void> };
+  sendSignal(
+    signal: unknown,
+    target: {
+      threadId: string;
+      resourceId: string;
+      ifIdle?: { behavior?: 'wake'; streamOptions?: { requestContext?: RequestContext } };
+    },
+  ): { accepted: Promise<{ action?: string; reason?: string } | undefined> };
 };
+
+type ReplyCapability = {
+  sourceAgent: SignalSender;
+  sourceAgentId: string;
+  conversation: RemindConversation;
+};
+
+const replyCapabilities = new Map<string, ReplyCapability>();
 
 export interface RemindAskToolOptions extends SubconsciousRemindOptions {
   memory: Memory;
@@ -179,11 +195,6 @@ export interface RemindAskToolOptions extends SubconsciousRemindOptions {
   omModel?: ObservationalMemoryModel;
 }
 
-/**
- * Resolve a signal sender for the late (`wait: false`) answer. The tool execute context carries no
- * `sendSignal` of its own — the only route is the main agent instance, reached exactly the way
- * `packages/core/src/notifications/tool.ts:53-63` reaches it.
- */
 async function resolveSignalSender(context: AskToolContext): Promise<SignalSender | undefined> {
   const agentId = context.agent?.agentId;
   const getAgentById = context.mastra?.getAgentById;
@@ -192,24 +203,16 @@ async function resolveSignalSender(context: AskToolContext): Promise<SignalSende
   return typeof agent?.sendSignal === 'function' ? (agent as SignalSender) : undefined;
 }
 
-/** Rough token estimate for text about to be sent to a model: chars / 4. */
-function estimateTokens(...texts: Array<string | undefined>): number {
-  return Math.ceil(texts.reduce((total, text) => total + (text?.length ?? 0), 0) / 4);
-}
-
-/**
- * The reminder agent's answer channel, and the ONLY authority that can complete a question
- * successfully. A run finishing with text says nothing about which question it answered — a turn may
- * service several questions or none — so success is claimed explicitly against a correlation id.
- *
- * Lane ownership is validated against the trusted execution context, never against model input: the
- * model supplies the correlation id, the runtime supplies the thread and resource the reply came from.
- */
-function createReplyTool(registry: RemindRequestRegistry, lane: RemindLane) {
+function createReplyTool(
+  registry: RemindRequestRegistry,
+  conversation: RemindConversation,
+  allowedCorrelationIds: ReadonlySet<string>,
+  sourceAgent: SignalSender,
+) {
   return createTool({
     id: 'reply_to_memory_question',
     description:
-      'Deliver the answer to a question the main agent asked. Call this exactly once per question with the correlationId that came with it. This is the only way an answer reaches the asker.',
+      'Deliver the terminal answer to a question the main agent asked. Call this exactly once with the correlationId that came with the current question.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -222,47 +225,145 @@ function createReplyTool(registry: RemindRequestRegistry, lane: RemindLane) {
     execute: async (input, rawContext) => {
       const { correlationId, answer } = input as { correlationId: string; answer: string };
       const context = rawContext as AskToolContext;
-      if (context.agent?.threadId !== lane.remindThreadId || context.agent?.resourceId !== lane.resourceId) {
-        return { ok: false, error: `reply_to_memory_question was called outside the lane that owns ${correlationId}.` };
+      if (!allowedCorrelationIds.has(correlationId)) {
+        return {
+          ok: false,
+          correlationId,
+          error: `Question ${correlationId} is not part of the current reminder input.`,
+        };
+      }
+      if (
+        context.agent?.threadId !== conversation.remindThreadId ||
+        context.agent?.resourceId !== conversation.resourceId
+      ) {
+        return { ok: false, correlationId, error: `Question ${correlationId} belongs to another conversation.` };
       }
 
-      // Deliberately uncaught: settlement is a map lookup and two comparisons, so a throw here is our
-      // bug, not a state the caller can reach. Swallowing it into a terminal status would invent a
-      // state nothing outside this process can produce; let it surface and leave the deadline as the
-      // backstop that stops the asker waiting forever.
-      const completion = registry.complete(correlationId, { ok: true, correlationId, status: 'replied', answer }, lane);
-      switch (completion.outcome) {
-        case 'settled':
-          return { ok: true, correlationId, delivered: true };
-        case 'duplicate':
-          // An exact retry of an answer already delivered. Idempotent: nothing is emitted twice.
-          return { ok: true, correlationId, delivered: true, duplicate: true };
-        default:
-          return {
-            ok: false,
-            correlationId,
-            error:
-              completion.reason === 'unknown'
-                ? `No open question with correlationId ${correlationId}. It may have timed out already.`
-                : completion.reason === 'wrong_lane'
-                  ? `Question ${correlationId} belongs to another conversation.`
-                  : `Question ${correlationId} was already answered with a different result.`,
-          };
+      const reservation = registry.reserveTerminal(correlationId, conversation);
+      if (reservation.outcome === 'duplicate') {
+        return { ok: true, correlationId, delivered: true, duplicate: true };
       }
+      if (reservation.outcome === 'rejected') {
+        return {
+          ok: false,
+          correlationId,
+          error:
+            reservation.reason === 'unknown'
+              ? `No open question with correlationId ${correlationId}. It may have timed out already.`
+              : reservation.reason === 'wrong_conversation'
+                ? `Question ${correlationId} belongs to another conversation.`
+                : `Question ${correlationId} can no longer accept a terminal answer.`,
+        };
+      }
+
+      const signal = createSignal({
+        id: reservation.record.terminalSignalId!,
+        type: 'reactive',
+        tagName: 'remembered',
+        contents: answer,
+        createdAt: new Date(),
+        transient: false,
+        metadata: { origin: 'subconscious' },
+        attributes: {
+          source: 'subconscious',
+          agent: 'remind',
+          correlationId,
+          sequence: reservation.record.terminalSequence,
+          status: 'replied',
+          sourceAgentId: replyCapabilities.get(correlationId)?.sourceAgentId,
+          sourceThreadId: reservation.record.sourceThreadId,
+          sourceResourceId: reservation.record.sourceResourceId,
+          remindThreadId: conversation.remindThreadId,
+          remindResourceId: conversation.resourceId,
+        },
+      });
+
+      let accepted: { action?: string; reason?: string } | undefined;
+      try {
+        accepted = await sourceAgent.sendSignal(signal, {
+          threadId: reservation.record.sourceThreadId,
+          resourceId: reservation.record.sourceResourceId,
+          ifIdle: { behavior: 'wake', streamOptions: { requestContext: context.requestContext } },
+        }).accepted;
+      } catch (error) {
+        registry.fail(correlationId, 'delivery_unknown', error instanceof Error ? error.message : String(error));
+        replyCapabilities.delete(correlationId);
+        return { ok: false, correlationId, error: 'Terminal answer delivery could not be confirmed.' };
+      }
+
+      if (accepted?.action === 'blocked' || accepted?.action === 'discard') {
+        registry.fail(correlationId, 'delivery_failed', accepted.reason ?? accepted.action);
+        replyCapabilities.delete(correlationId);
+        return {
+          ok: false,
+          correlationId,
+          error: `The source conversation refused the answer: ${accepted.reason ?? accepted.action}.`,
+        };
+      }
+
+      registry.markReplied(correlationId);
+      replyCapabilities.delete(correlationId);
+      return { ok: true, correlationId, delivered: true };
     },
   });
 }
 
-/**
- * The one reminder agent factory. Asks and passive reminder evaluations build the same agent with the
- * same toolset: a question can be delivered into a run that a passive evaluation started, and that run
- * must be able to answer it.
- */
+export function createReplyToolProcessor(
+  registry: RemindRequestRegistry,
+  conversation: RemindConversation,
+): InputProcessor {
+  return {
+    id: 'remind-current-question-tools',
+    processInputStep(args: ProcessInputStepArgs): ProcessInputStepResult | undefined {
+      const correlations = new Set<string>();
+      let capability: ReplyCapability | undefined;
+      for (const message of args.messages as Array<{
+        metadata?: Record<string, unknown>;
+        content?: string | { parts?: Array<{ type?: string; text?: string }> };
+      }>) {
+        const metadata = message.metadata;
+        const content = message.content;
+        const text =
+          typeof content === 'string'
+            ? content
+            : (content?.parts ?? [])
+                .filter(part => part.type === 'text')
+                .map(part => part.text ?? '')
+                .join('\n');
+        const correlationId =
+          metadata?.kind === 'remind-ask' && typeof metadata.correlationId === 'string'
+            ? metadata.correlationId
+            : /correlationId: (remind-ask-[0-9a-f-]+)/.exec(text)?.[1];
+        if (!correlationId) continue;
+        const record = registry.get(correlationId);
+        const candidate = replyCapabilities.get(correlationId);
+        if (!record || record.status !== 'pending' || !candidate) continue;
+        if (
+          candidate.conversation.remindThreadId !== conversation.remindThreadId ||
+          candidate.conversation.resourceId !== conversation.resourceId
+        ) {
+          continue;
+        }
+        if (capability && capability.sourceAgent !== candidate.sourceAgent) continue;
+        capability = candidate;
+        correlations.add(correlationId);
+      }
+      if (!capability || correlations.size === 0) return undefined;
+      return {
+        tools: {
+          ...args.tools,
+          reply_to_memory_question: createReplyTool(registry, conversation, correlations, capability.sourceAgent),
+        },
+      };
+    },
+  };
+}
+
 function createReminderAgent(args: {
   parentThreadId: string;
-  lane: RemindLane;
+  conversation: RemindConversation;
   instructions: string;
-  model: NonNullable<Awaited<ReturnType<typeof resolveReminderLaneModel>>>;
+  model: NonNullable<Awaited<ReturnType<typeof resolveReminderConversationModel>>>;
   memory: Memory;
   scope: KnowledgeScope;
   registry: RemindRequestRegistry;
@@ -274,16 +375,14 @@ function createReminderAgent(args: {
     instructions: args.instructions,
     model: args.model,
     ...(args.remindMemory ? { memory: args.remindMemory } : {}),
-    tools: {
-      ...createKnowledgeTools(args.memory, args.scope),
-      reply_to_memory_question: createReplyTool(args.registry, args.lane),
-    },
+    tools: createKnowledgeTools(args.memory, args.scope),
+    inputProcessors: [createReplyToolProcessor(args.registry, args.conversation)],
   });
 }
 
-interface ReminderLaneTurnArgs {
+interface ReminderConversationTurnArgs {
   agent: Agent;
-  /** The PARENT session thread id; the lane thread key is derived from it. */
+  /** The parent session thread id; the reminder thread key is derived from it. */
   parentThreadId: string;
   resourceId: string;
   prompt: string;
@@ -291,101 +390,72 @@ interface ReminderLaneTurnArgs {
   maxSteps?: number;
   deadlineMs?: number;
   /**
-   * Rejects the waiter when aborted. The lane turn itself is NOT cancelled — it completes and its
-   * transcript persists in order; only the caller stops waiting.
+   * Rejects this passive evaluation when aborted. The reminder turn itself is not cancelled, so its
+   * transcript can still persist in causal order.
    */
   abortSignal?: AbortSignal;
 }
 
 /**
- * Run one serialized turn on the reminder lane, for the passive reminder evaluation only.
+ * Run one serialized passive-evaluation turn in the continuing reminder conversation.
  *
- * Asks do not come through here. A passive evaluation wants the turn's final text, so it can afford
- * to own a run and read what that run said; a question cannot, because the lane's runs are shared and
- * one run may carry several questions. Asks therefore mint a correlation id and dispatch through
- * `sendMessage` (see `createRemindAskTool`), and their answers come back through the reply tool
- * rather than from any run's output.
+ * Explicit questions bypass this helper: they are acknowledged after `sendMessage()` accepts them,
+ * and correlated answers return directly through source-agent signals. Passive evaluation needs the
+ * accepted wake run's final text, so it consumes that run's stream without attributing question
+ * answers to run completion.
  *
- * What both paths share is the thread: this helper enqueues the prompt as a message signal on the
- * reminder thread via `Agent.queueMessage`, and the core thread-stream runtime owns serialization —
- * an idle lane wakes one run immediately, a busy lane queues the message and wakes it when the
- * current run finishes, and cross-process wake races resolve to a single owner while the pubsub lease is
- * healthy — the lease fails open, so an outage can let two processes start a turn. While that ownership
- * holds, each turn reads the latest lane history, executes alone, and persists its user/assistant messages in causal
- * order — the "one continuing conversation" contract that keeps a question and a passive reminder
- * from talking over each other.
- *
- * The completion callback rides in the queued entry's stream options, so this turn resolves its own
- * waiter. That is in-process: if another process wins the wake race and executes the turn, the
- * transcript still persists in order, but this waiter falls to the deadline.
+ * Both paths use the same resource and reminder thread. The core thread-stream runtime owns active,
+ * reserved, and idle routing, serializes turns, and persists conversation history in causal order.
  */
-function runReminderLaneTurn(args: ReminderLaneTurnArgs): Promise<string> {
+async function runReminderConversationTurn(args: ReminderConversationTurnArgs): Promise<string> {
   const threadId = remindThreadKey(args.parentThreadId);
-  const deadlineMs = args.deadlineMs ?? LANE_TURN_DEADLINE_MS;
-  return new Promise<string>((resolve, reject) => {
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      reject(new Error(`The reminder lane did not complete this turn within ${deadlineMs}ms.`));
-    }, deadlineMs);
-    // The waiter must never outlive the host process just to keep a deadline armed.
-    (timer as { unref?: () => void }).unref?.();
-    const onAbort = () =>
-      finish(() => reject(new Error('The caller aborted while waiting for the reminder lane turn.')));
-    const finish = (fn: () => void) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      args.abortSignal?.removeEventListener('abort', onAbort);
-      fn();
-    };
-    if (args.abortSignal?.aborted) {
-      onAbort();
-      return;
-    }
-    args.abortSignal?.addEventListener('abort', onAbort, { once: true });
-    try {
-      const result = args.agent.queueMessage(args.prompt, {
-        threadId,
-        resourceId: args.resourceId,
-        ifIdle: {
-          streamOptions: {
-            requestContext: args.requestContext,
-            maxSteps: args.maxSteps,
-            onFinish: event => finish(() => resolve((event.text ?? '').trim())),
-            // A run that fails after it started reports here; without it the waiter would burn
-            // the full deadline on an ordinary model or tool failure.
-            onError: ({ error }: { error: Error | string }) =>
-              finish(() => reject(error instanceof Error ? error : new Error(String(error)))),
-          },
-        },
-      });
-      // `accepted` settles at routing-decision time. A rejection means the signal could not be
-      // routed at all; a `blocked` disposition means the turn will never run, so both reject the
-      // waiter immediately instead of burning the full deadline. A synchronous throw from stream
-      // setup on the drain side never reaches these callbacks, so the deadline stays as the
-      // terminal backstop for that residue.
-      result.accepted
-        .then((disposition: { action?: string; reason?: string } | undefined) => {
-          if (disposition?.action === 'blocked') {
-            finish(() =>
-              reject(new Error(`The reminder lane refused this turn: ${disposition.reason ?? 'thread-blocked'}.`)),
-            );
-          }
-        })
-        .catch((error: unknown) => finish(() => reject(error)));
-    } catch (error) {
-      finish(() => reject(error));
-    }
+  const deadlineMs = args.deadlineMs ?? REMINDER_TURN_DEADLINE_MS;
+  if (args.abortSignal?.aborted) {
+    throw new Error('The caller aborted while waiting for the reminder conversation turn.');
+  }
+
+  const result = args.agent.sendMessage(args.prompt, {
+    threadId,
+    resourceId: args.resourceId,
+    ifIdle: {
+      behavior: 'wake',
+      streamOptions: {
+        requestContext: args.requestContext,
+        maxSteps: args.maxSteps,
+      },
+    },
   });
+  const accepted = await Promise.race([
+    result.accepted,
+    new Promise<never>((_, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`The reminder conversation did not accept this turn within ${deadlineMs}ms.`)),
+        deadlineMs,
+      );
+      (timer as { unref?: () => void }).unref?.();
+    }),
+  ]);
+
+  if (accepted.action === 'blocked' || accepted.action === 'discard') {
+    throw new Error(
+      accepted.action === 'blocked'
+        ? `The reminder conversation is blocked: ${accepted.reason}.`
+        : 'The reminder conversation discarded this turn.',
+    );
+  }
+  if (accepted.action !== 'wake') return NO_REMINDER;
+
+  if (args.abortSignal?.aborted) {
+    throw new Error('The caller aborted while waiting for the reminder conversation turn.');
+  }
+  await accepted.output.consumeStream();
+  return (await accepted.output.getFullOutput()).text.trim();
 }
 
 /**
- * The reminder agent as an agent-facing tool. The main agent asks a natural language question and
- * either waits for the answer or takes a correlation id back and receives the answer later as a
- * signal. Both dispositions enter the same serialized reminder lane the passive path uses, so a
- * question and its answer become part of the one conversation.
+ * The reminder agent as an agent-facing tool. The main agent receives an immediate routing
+ * acknowledgement; the answer returns later as a correlated source-agent signal. Questions and
+ * passive evaluations enter the same serialized reminder conversation.
  */
 export function createRemindAskTool(options: RemindAskToolOptions) {
   const { memory, config, omModel } = options;
@@ -393,71 +463,48 @@ export function createRemindAskTool(options: RemindAskToolOptions) {
   // reminder agent that answers it on two different authorities whenever an owner wired none.
   const registry = options.registry ?? fallbackRegistry();
 
-  /**
-   * The single dispatch path. Blocking and detached asks differ only in what the caller does with the
-   * returned record — the identity, the registration, and the delivery are identical.
-   */
+  /** The single acceptance-only dispatch path for every explicit reminder question. */
   const dispatch = async (
     question: string,
     context: AskToolContext,
     threadId: string,
+    sourceAgent: SignalSender,
   ): Promise<RemindRequestRecord> => {
-    const scope = resolveScope({
-      requestContext: context.requestContext,
-      resourceId: context.agent?.resourceId,
-      threadId,
-    });
+    const sourceResourceId = context.agent?.resourceId;
+    const sourceAgentId = context.agent?.agentId;
+    if (!sourceResourceId || !sourceAgentId) {
+      throw new ReminderUnavailableError('ask_memory requires an active source Agent, thread, and resource.');
+    }
+
+    const scope = resolveScope({ requestContext: context.requestContext, resourceId: sourceResourceId, threadId });
     const instructions = [DEFAULT_INSTRUCTIONS, ASK_INSTRUCTIONS, config.instructions?.trim()]
       .filter(Boolean)
       .join('\n\n');
-    const model = await resolveReminderLaneModel({
-      config,
-      omModel,
-      requestContext: context.requestContext,
-      estimatedInputTokens: estimateTokens(instructions, question),
-    });
-    if (!model) {
-      throw new ReminderUnavailableError(NO_MODEL_MESSAGE);
-    }
+    const model = await resolveReminderConversationModel({ config, omModel, requestContext: context.requestContext });
+    if (!model) throw new ReminderUnavailableError(NO_MODEL_MESSAGE);
 
-    const lane: RemindLane = {
+    const conversation: RemindConversation = {
       remindThreadId: remindThreadKey(threadId),
-      resourceId: laneResourceId(threadId, context.agent?.resourceId),
+      resourceId: reminderResourceId(threadId, sourceResourceId),
     };
-    // Identity exists before anything is sent. Nothing the transport reports back — not a run id, not a
-    // final text — is ever used to decide which question an *answer* belongs to. The run id is used only
-    // in the other direction: to fail the questions a dying run was carrying.
     const correlationId = `remind-ask-${crypto.randomUUID()}`;
-    const record = registry.create({ correlationId, question, lane, parentThreadId: threadId });
+    const record = registry.create({
+      correlationId,
+      conversation,
+      sourceThreadId: threadId,
+      sourceResourceId,
+    });
+    replyCapabilities.set(correlationId, { sourceAgent, sourceAgentId, conversation });
 
-    // A run failure can fire before `accepted` resolves, so the run id and the failure meet on this token
-    // rather than racing: whichever lands second applies the other.
-    const token: { runId?: string; failure?: string } = {};
-    const failRun = () => {
-      if (!token.runId || !token.failure) return;
-      for (const pendingId of registry.pendingForRun(token.runId)) {
-        registry.complete(pendingId, {
-          ok: false,
-          correlationId: pendingId,
-          status: 'model_failed',
-          error: token.failure,
-        });
-      }
+    const fail = (status: 'delivery_failed' | 'model_failed', error: unknown) => {
+      registry.fail(correlationId, status, error instanceof Error ? error.message : String(error));
+      replyCapabilities.delete(correlationId);
     };
-    const failDelivery = (error: unknown) =>
-      registry.complete(correlationId, {
-        ok: false,
-        correlationId,
-        status: 'delivery_failed',
-        error: error instanceof Error ? error.message : String(error),
-      });
 
     try {
-      // Built inside the guard: `createRemindMemory` reaches real storage and can throw, and a throw
-      // out here would leave the record above pending until the deadline reaped it two minutes later.
       const agent = createReminderAgent({
         parentThreadId: threadId,
-        lane,
+        conversation,
         instructions,
         model,
         memory,
@@ -465,232 +512,95 @@ export function createRemindAskTool(options: RemindAskToolOptions) {
         registry,
         remindMemory: options.createRemindMemory?.(),
       });
-
       const contents = `Current time: ${new Date().toISOString()}\n\nQuestion [correlationId: ${correlationId}]: ${question}\n\nAnswer this by calling reply_to_memory_question with correlationId "${correlationId}".`;
-
       const result = agent.sendMessage(
         {
           contents,
           metadata: {
             correlationId,
             kind: 'remind-ask',
+            sourceAgentId,
+            sourceThreadId: threadId,
+            sourceResourceId,
             parentThreadId: threadId,
-            remindThreadId: lane.remindThreadId,
+            remindThreadId: conversation.remindThreadId,
           },
         },
         {
-          threadId: lane.remindThreadId,
-          resourceId: lane.resourceId,
+          threadId: conversation.remindThreadId,
+          resourceId: conversation.resourceId,
           ifIdle: {
+            behavior: 'wake',
             streamOptions: {
               requestContext: context.requestContext,
               maxSteps: config.maxSteps,
-              // Failure authority only: this closes questions this run was carrying, and never claims
-              // success for any of them.
-              onError: ({ error }: { error: Error | string }) => {
-                token.failure = error instanceof Error ? error.message : String(error);
-                failRun();
-              },
+              onError: ({ error }: { error: Error | string }) => fail('model_failed', error),
             },
           },
         },
       );
-      result.accepted
-        .then((disposition: { action?: string; runId?: string; reason?: string } | undefined) => {
-          if (disposition?.action === 'blocked' || disposition?.action === 'discard') {
-            failDelivery(
-              new Error(`The reminder lane refused this turn: ${disposition.reason ?? disposition.action}.`),
-            );
-            return;
-          }
-          // Defensive: a disposition with no run id leaves the request pending with the deadline as its
-          // only backstop. This call site takes the runtime defaults (`wake` when idle, `deliver` when
-          // busy), so it does not ask for the run-less `persist` behaviour today.
-          if (disposition?.runId) {
-            token.runId = disposition.runId;
-            registry.associateRun(correlationId, disposition.runId);
-            failRun();
-          }
-          // A woken run hands back an unconsumed stream: nothing executes until someone drains it, and
-          // this lane agent is never registered with a Mastra instance, so nothing else will. Draining is
-          // what lets the run reach `onError` above; it is not a second failure surface, because
-          // `consumeStream` reports a dying stream through its own callback instead of rejecting. The
-          // catch below cannot see a dying run at all: `consumeStream` is async, and read failures go to
-          // that callback rather than rejecting. It is there to keep a rejection out of the unhandled set
-          // — the reachable one is `getReader()` on a base stream something else already locked.
-          const output = (disposition as { output?: { consumeStream?: () => Promise<void> } } | undefined)?.output;
-          void output?.consumeStream?.().catch((error: unknown) => {
-            token.failure = error instanceof Error ? error.message : String(error);
-            failRun();
-          });
-        })
-        .catch(failDelivery);
+      const disposition = await result.accepted;
+      if (disposition.action === 'blocked' || disposition.action === 'discard') {
+        fail('delivery_failed', disposition.action === 'blocked' ? disposition.reason : disposition.action);
+      } else if (disposition.action === 'wake') {
+        void disposition.output.consumeStream().catch(error => fail('model_failed', error));
+      }
     } catch (error) {
-      failDelivery(error);
+      fail('delivery_failed', error);
     }
 
     return record;
   };
 
-  const sendAnswerSignal = async (
-    sender: SignalSender,
-    args: {
-      threadId: string;
-      resourceId: string;
-      correlationId: string;
-      question: string;
-      status: string;
-      contents: string;
-    },
-  ) => {
-    const result = sender.sendSignal(
-      createSignal({
-        id: `__subconscious_remembered_${crypto.randomUUID()}`,
-        type: 'reactive',
-        tagName: 'remembered',
-        contents: args.contents,
-        createdAt: new Date(),
-        metadata: { origin: 'subconscious' },
-        attributes: {
-          source: 'subconscious',
-          agent: 'remind',
-          threadId: args.threadId,
-          // Names the question this answer belongs to. Without it a late answer arriving after the
-          // conversation moved on is unattributable, which is the whole point of `wait: false`.
-          correlationId: args.correlationId,
-          question: args.question,
-          /** The terminal state this delivery reports: `replied`, or one of the failure states. */
-          status: args.status,
-        },
-      }),
-      { threadId: args.threadId, resourceId: args.resourceId },
-    );
-    // Await the persist write when the sender exposes one. When it does not, resolving here does
-    // NOT mean the answer is durable — delivery stays best-effort and in-process, and the tool's
-    // acceptance wording says exactly that rather than implying a durable queue.
-    await result?.persisted;
-  };
-
   const askMemory = createTool({
     id: 'ask_memory',
     description:
-      'Ask the reminder agent a question in natural language about what this session already knows or discussed, for example "when did that happen". It remembers this session\'s earlier reminders and questions, so follow-ups that refer back to an earlier turn resolve. Set wait to false to keep working and receive the answer later as a signal carrying the returned correlationId. Detached answers are best-effort and in-process only: if this process exits before the answer lands, it is lost.',
+      'Ask the reminder agent a question about what this session already knows or discussed. The question is accepted immediately; its terminal answer arrives later as a correlated reactive remembered signal.',
     inputSchema: {
       type: 'object',
       properties: {
         question: { type: 'string', minLength: 1, description: 'The question, in natural language.' },
-        wait: {
-          type: 'boolean',
-          description:
-            'True (default) blocks and returns the answer. False returns immediately with a correlationId; the answer arrives later as a signal carrying the same id.',
-        },
       },
       required: ['question'],
       additionalProperties: false,
     } satisfies JSONSchema7,
     execute: async (input, rawContext) => {
-      const { question, wait = true } = input as { question: string; wait?: boolean };
+      const { question } = input as { question: string };
       const context = rawContext as AskToolContext;
       const threadId = context.agent?.threadId;
-      if (!threadId) {
-        return { ok: false, error: 'ask_memory requires an active threadId.' };
-      }
+      if (!threadId) return { ok: false, error: 'ask_memory requires an active threadId.' };
 
-      if (wait) {
-        let record: RemindRequestRecord;
-        try {
-          record = await dispatch(question, context, threadId);
-        } catch (error) {
-          // Never throw out of the main agent's turn; hand it a result it can reason about.
-          return { ok: false, ...describeAskFailure(error) };
-        }
-        // Aborting stops this caller waiting. It does not cancel the lane run, and it settles only this
-        // request: a question the same run is carrying for someone else is untouched.
-        const onAbort = () =>
-          registry.complete(record.correlationId, {
-            ok: false,
-            correlationId: record.correlationId,
-            status: 'aborted',
-            error: 'The caller aborted while waiting for the answer.',
-          });
-        if (context.abortSignal?.aborted) onAbort();
-        else context.abortSignal?.addEventListener('abort', onAbort, { once: true });
-        try {
-          return await record.settled;
-        } finally {
-          context.abortSignal?.removeEventListener('abort', onAbort);
-        }
-      }
-
-      // Resolving the sender goes through the Mastra *agent* registry, which can itself fail; a broken
-      // lookup is a tool error, not a thrown turn.
-      let sender: SignalSender | undefined;
+      let sourceAgent: SignalSender | undefined;
       try {
-        sender = await resolveSignalSender(context);
+        sourceAgent = await resolveSignalSender(context);
       } catch (error) {
         return { ok: false, ...describeAskFailure(error) };
       }
-      const resourceId = context.agent?.resourceId;
-      if (!sender || !resourceId) {
-        return {
-          ok: false,
-          error:
-            'ask_memory cannot answer without blocking here: no signal channel is reachable from this tool call. Retry with wait set to true.',
-        };
+      if (!sourceAgent || !context.agent?.resourceId) {
+        return { ok: false, error: 'ask_memory requires the source Agent signal channel.' };
       }
 
-      // Same dispatch as the blocking mode; the caller's abort is deliberately NOT wired, because a
-      // detached answer must outlive the turn that asked for it.
       let record: RemindRequestRecord;
       try {
-        record = await dispatch(question, context, threadId);
+        record = await dispatch(question, context, threadId, sourceAgent);
       } catch (error) {
         return { ok: false, ...describeAskFailure(error) };
       }
-
-      if (record.status !== 'pending') {
-        // Dispatch failed outright — the lane agent could not be built, or the transport refused the
-        // message. Acknowledging "pending" here would be a lie the caller then waits on forever, and
-        // routing it through the signal channel would announce a failure to a turn that is still on
-        // the line to hear it directly.
-        return await record.settled;
+      if (record.status !== 'pending' && record.status !== 'replied') {
+        return {
+          ok: false,
+          correlationId: record.correlationId,
+          status: record.status,
+          error: record.failure?.message,
+        };
       }
-
-      void record.settled
-        .then(async (result: RemindRequestResult) => {
-          // The registry already settled exactly once; this delivery only reports that result and cannot
-          // reopen or re-settle it. Emission failure is a lost answer, not a second terminal state.
-          if (!result.ok) {
-            // `writer.custom` is best effort here: this runs after the tool's own turn, so the stream it
-            // wrote to is usually gone. The signal below is the channel that actually carries a late
-            // failure, with the correlation id naming the question it failed to answer.
-            await Promise.resolve(
-              context.writer?.custom({
-                type: 'data-subconscious-error',
-                data: { agent: 'remind', error: result.error },
-              }),
-            ).catch(() => {});
-          }
-          await sendAnswerSignal(sender, {
-            threadId,
-            resourceId,
-            correlationId: result.correlationId,
-            question,
-            status: result.status,
-            contents: result.ok ? result.answer : `Could not answer that question: ${result.error}`,
-          });
-        })
-        .catch(() => {
-          // This runs after the asking turn returned, so an escaping rejection would surface as an
-          // unhandled rejection in the host process.
-        });
 
       return {
         ok: true,
         accepted: true,
         correlationId: record.correlationId,
-        status: 'pending' as const,
-        note: 'Best effort: the answer is delivered in-process as a remembered signal carrying this correlationId. If the process exits first, the answer is lost and never retried.',
+        status: record.status,
+        note: 'The answer will arrive as a correlated reactive remembered signal. This segment has no blocking checkpoint.',
       };
     },
   });
@@ -748,23 +658,22 @@ export class SubconsciousRemindExtractor extends Extractor<string> {
             ? `\n\nRecent conversation messages (already visible to the agent — never remind about anything present here):\n${context.recentMessages}`
             : '';
           const prompt = `Current time: ${new Date().toISOString()}\n\nScoped source candidates:\n${JSON.stringify(sources)}\n\nCurrent observations:\n${context.rawObservations}${recentMessagesSection}`;
-          const model = await resolveReminderLaneModel({
+          const model = await resolveReminderConversationModel({
             config,
             omModel,
             mainAgent: context.mainAgent,
             requestContext: context.requestContext,
-            estimatedInputTokens: estimateTokens(instructions, prompt),
           });
           if (!model) return;
           // One reminder conversation per main-agent session. The thread key is derived from the
           // PARENT thread id, not from the agent id above, and matches the curate/learn convention.
-          // The evaluation enters the same serialized lane as asks, so a passive reminder never
-          // interleaves with an in-flight question turn.
+          // The evaluation enters the same serialized conversation as asks, so a passive reminder
+          // never interleaves with an in-flight question turn.
           const agent = createReminderAgent({
             parentThreadId: context.threadId,
-            lane: {
+            conversation: {
               remindThreadId: remindThreadKey(context.threadId),
-              resourceId: laneResourceId(context.threadId, context.resourceId),
+              resourceId: reminderResourceId(context.threadId, context.resourceId),
             },
             instructions,
             model,
@@ -775,15 +684,15 @@ export class SubconsciousRemindExtractor extends Extractor<string> {
             registry: options?.registry ?? fallbackRegistry(),
             remindMemory: options?.createRemindMemory?.(),
           });
-          const reminder = await runReminderLaneTurn({
+          const reminder = await runReminderConversationTurn({
             agent,
             parentThreadId: context.threadId,
-            resourceId: laneResourceId(context.threadId, context.resourceId),
+            resourceId: reminderResourceId(context.threadId, context.resourceId),
             prompt,
             requestContext: context.requestContext,
             maxSteps: config.maxSteps,
-            // The passive evaluation stopped waiting when its calling turn aborted before this path
-            // moved onto the lane; keep that. The lane turn itself still completes and persists.
+            // The passive evaluation stops waiting when its calling turn aborts. The reminder turn
+            // itself may still complete and persist in causal order.
             abortSignal: context.abortSignal,
           });
           if (!reminder || /^<no-reminder\s*\/>$/i.test(reminder)) {
