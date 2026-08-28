@@ -102,6 +102,7 @@ export class RemindRequestRegistry {
     record.status = 'terminal_sending';
     record.terminalSequence = 1;
     record.terminalSignalId = `remind-answer:${correlationId}:terminal`;
+    this.#clearDeadline(correlationId);
     return { outcome: 'reserved', record };
   }
 

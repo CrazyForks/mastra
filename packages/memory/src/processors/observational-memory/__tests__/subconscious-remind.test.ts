@@ -12,7 +12,7 @@ import { ModelByInputTokens } from '../model-by-input-tokens';
 import { SubconsciousRemindExtractor } from '../subconscious';
 import { resolveReminderConversationModel, resolveSubconsciousAgentModel } from '../subconscious/model';
 import { createRemindAskTool, createReplyToolProcessor } from '../subconscious/remind';
-import { RemindRequestRegistry } from '../subconscious/remind-request-state';
+import { REMINDER_TURN_DEADLINE_MS, RemindRequestRegistry } from '../subconscious/remind-request-state';
 
 function createModel(response: string) {
   return new MockLanguageModelV2({
@@ -827,6 +827,36 @@ describe('Subconscious remind ask conversation', () => {
   async function settle() {
     for (let i = 0; i < 5; i++) await new Promise(resolve => setTimeout(resolve, 0));
   }
+
+  it.each([
+    ['routing acceptance', { accepted: new Promise(() => {}) }],
+    ['signal persistence', { accepted: Promise.resolve({ action: 'persist' }), persisted: new Promise(() => {}) }],
+  ])('fails terminal delivery when %s never settles', async (_label, signalResult) => {
+    vi.useFakeTimers();
+    const { tools, generateSpy, registry } = createAskTool({ response: 'A terminal answer.' });
+    const sourceAgent = { sendSignal: vi.fn(() => signalResult) };
+    try {
+      const result: any = await tools.ask_memory.execute!(
+        { question: 'what happened?' } as any,
+        askContext({ mastra: { getAgentById: vi.fn(async () => sourceAgent) } }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(registry.get(result.correlationId)?.status).toBe('terminal_sending');
+
+      await vi.advanceTimersByTimeAsync(REMINDER_TURN_DEADLINE_MS);
+      expect(registry.get(result.correlationId)).toMatchObject({
+        status: 'delivery_unknown',
+        failure: {
+          status: 'delivery_unknown',
+          message: `Terminal answer delivery timed out after ${REMINDER_TURN_DEADLINE_MS}ms`,
+        },
+      });
+    } finally {
+      generateSpy.mockRestore();
+      registry.dispose();
+      vi.useRealTimers();
+    }
+  });
 
   it('accepts a question when the observational memory model is the default sentinel', async () => {
     const { tools, generateSpy } = createAskTool({ omModel: 'default', response: 'Answered on the default model.' });

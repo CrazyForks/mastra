@@ -208,9 +208,27 @@ function deleteReplyCapability(capabilities: ReplyCapabilityRegistry, correlatio
 }
 
 async function acceptSignalDelivery(result: SendAgentSignalResult): Promise<SendAgentSignalAccepted> {
-  const disposition = await result.accepted;
-  if (disposition.action === 'persist') await result.persisted;
-  return disposition;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`Terminal answer delivery timed out after ${REMINDER_TURN_DEADLINE_MS}ms`)),
+      REMINDER_TURN_DEADLINE_MS,
+    );
+    timer.unref?.();
+  });
+
+  try {
+    return await Promise.race([
+      (async () => {
+        const disposition = await result.accepted;
+        if (disposition.action === 'persist') await result.persisted;
+        return disposition;
+      })(),
+      timeout,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 export interface RemindAskToolOptions extends SubconsciousRemindOptions {
