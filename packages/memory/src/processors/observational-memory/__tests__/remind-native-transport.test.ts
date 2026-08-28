@@ -43,7 +43,7 @@ it('native transport: idle source delivery can wake through the bound source Age
   );
 });
 
-it('native transport: source conversation consumes a correlated reactive signal end to end', () => {
+it('native transport: terminal signals use the deterministic correlated reactive contract', () => {
   expectArchitecture(
     requestStateSource.includes('`remind-answer:${correlationId}:terminal`') &&
       remindSource.includes("type: 'reactive'"),
