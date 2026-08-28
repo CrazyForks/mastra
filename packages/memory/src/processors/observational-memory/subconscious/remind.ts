@@ -380,7 +380,7 @@ export function createReplyToolProcessor(
         const correlationId =
           metadata?.kind === 'remind-ask' && typeof metadata.correlationId === 'string'
             ? metadata.correlationId
-            : /correlationId: (remind-ask-[0-9a-f-]+)/.exec(text)?.[1];
+            : /Question \[correlationId: (remind-ask-[0-9a-f-]+)\]:/.exec(text)?.[1];
         if (!correlationId) continue;
         const record = registry.get(correlationId);
         const candidate = capabilities.get(correlationId);

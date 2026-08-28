@@ -117,6 +117,7 @@ export class RemindRequestRegistry {
   fail(correlationId: string, status: RemindRequestFailureStatus, message: string): void {
     const record = this.#entries.get(correlationId);
     if (!record || (record.status !== 'pending' && record.status !== 'terminal_sending')) return;
+    if (status === 'timed_out' && record.status === 'terminal_sending') return;
     record.status = status;
     record.terminalAt = Date.now();
     record.failure = { status, message };

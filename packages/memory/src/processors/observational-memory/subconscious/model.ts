@@ -27,9 +27,9 @@ export function usableObservationalMemoryModel(
 
 /**
  * Resolve the model the reminder conversation runs on, preserving configured failover. A
- * configured reminder-agent model wins. Otherwise an Agent-compatible observational-memory model
- * passes through unchanged so the Agent can resolve dynamic and token-routed configuration against
- * its complete conversation and tool context.
+ * configured reminder-agent model wins, followed by an Agent-compatible observational-memory
+ * model and the source Agent model. Token-routed observational-memory configuration is unavailable
+ * here because its complete persisted conversation and tool context are not available to resolve it.
  */
 export async function resolveReminderConversationModel(options: {
   config: ResolvedSubconsciousAgent;

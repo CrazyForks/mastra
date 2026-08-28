@@ -150,6 +150,19 @@ describe('RemindRequestRegistry', () => {
     });
   });
 
+  it('does not overwrite an in-flight terminal delivery with the question deadline', async () => {
+    vi.useFakeTimers();
+    const registry = makeRegistry({ deadlineMs: 50 });
+    register(registry, 'remind-ask-in-flight');
+    registry.reserveTerminal('remind-ask-in-flight', conversation);
+
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(registry.get('remind-ask-in-flight')).toMatchObject({ status: 'terminal_sending' });
+    registry.markReplied('remind-ask-in-flight');
+    expect(registry.get('remind-ask-in-flight')).toMatchObject({ status: 'replied' });
+  });
+
   it('keeps terminal lifecycle state bounded', () => {
     const registry = makeRegistry({ maxTerminalEntries: 2 });
     for (const correlationId of ['first', 'second', 'third']) {
